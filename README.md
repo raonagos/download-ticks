@@ -1,232 +1,165 @@
-# download-ticks — the data spine
+# download-ticks
 
-`download-ticks` is the only way market data enters System One. It fetches,
-verifies, and normalises the coupled tape that `trad` trains and scores on:
+A command-line tool for downloading historical trading data from public
+exchange APIs.
 
-```text
-1-minute klines + aggTrades + bookTicker/bookDepth + funding
-```
+`download-ticks` fetches klines (candlesticks) over a date range, splits the
+range into API-sized chunks, downloads the chunks concurrently, and stores the
+exchange's raw JSON rows in one array. It is built for reliable bulk downloads:
+bounded concurrency, retries with backoff, ordered streaming writes, and atomic
+output.
 
-It is resumable and idempotent. It never interpolates a gap, never silently
-drops a failed chunk, and writes a manifest that identifies the dataset.
+## Features
 
-> **Status 2026-11-11.** The current code fetches klines only, through REST.
-> The TLS build uses `rustls` and no longer needs OpenSSL. Downloads run as a
-> bounded `JoinSet` (one Tokio task per request), retry transient failures with
-> exponential backoff, stream chunks to the output in request order, and publish
-> the file with an atomic rename. There is still no checksum/resume/verify path
-> and no Vision archive client. This README defines the target. The rewrite
-> lands in this repository's PR, one step at a time.
+- **Concurrent and bounded.** `--jobs` controls how many requests are in
+  flight. Each request runs as a Tokio task on the multi-thread runtime.
+- **Resilient.** Retries `408`, `429`, `5xx`, connection, and timeout failures
+  with exponential backoff and jitter; honours `Retry-After`.
+- **Bounded memory.** Completed chunks are written in request order as soon as
+  the preceding chunk is available, so memory does not grow with the range.
+- **Atomic.** The destination is written through a `.part` file and renamed
+  only after the JSON array is closed. A failed run leaves no partial output.
+- **Faithful.** Every row is the exchange's raw JSON array. Prices keep their
+  original strings and precision; nothing is re-serialised or interpolated.
+- **Portable.** `reqwest` uses `rustls-tls`; no OpenSSL headers are required.
 
-## Why it exists
+## Supported data
 
-The previous corpus was lost. A trading result is only reproducible if its data
-has an identity: source, range, checksums, row counts, gaps, and the tool commit
-that produced it. `download-ticks` owns that identity. No ad-hoc `curl`, no
-throwaway script, no vendor upload.
+| exchange | venue | klines |
+| --- | --- | --- |
+| Binance | USD-M perpetual futures (`--venue um`, default) | yes |
+| Binance | spot (`--venue spot`) | yes |
+| Gate.io | spot | yes |
 
-The primary venue is **Binance USD-M perpetual** because Binance Vision
-archives `bookTicker` (event-level best bid/ask) and `bookDepth` (aggregate
-depth at ±1..5% every ~30 s) for it. It does not archive a full top-20 ladder.
-Spot has `bookTicker` only.
+More products (aggregated trades, book ticker/depth, funding rates) and bulk
+archive sources are on the roadmap.
 
 ## Build
 
 ```sh
 cargo build --release
-cargo test  --release
+cargo test --release
 ```
 
-`reqwest` uses `rustls-tls`; no OpenSSL headers are required.
-
-## Commands
-
-The CLI is organised around a fetch, a verify, and a manifest.
-
-### Current CLI
-
-The current build implements kline `fetch` and `info` over REST, for Binance
-(spot or USD-M) and Gate.io (spot). The `--kind`, `--source`, `--resume`,
-`--verify`, and `--out` forms in the target examples below are not parsed yet.
+## Usage
 
 ```sh
-# One day of USD-M perpetual 1-minute klines, 16 requests in flight.
-download-ticks fetch --market binance --venue um --symbol BTCUSDT \
-  --interval 1m --from-date 2024-01-15T00:00:00Z \
-  --to-date 2024-01-15T23:59:59Z --output-file btcusdt-1m-2024-01-15.json \
-  --jobs 16
+# Latest 1,000 one-minute BTCUSDT USD-M candles (no output file).
+download-ticks fetch --symbol BTCUSDT --interval 1m
 
-# Inspect the stored JSON array.
-download-ticks info --input-file btcusdt-1m-2024-01-15.json
+# One full year of USD-M klines, 16 requests in flight.
+download-ticks fetch --symbol BTCUSDT --interval 1m \
+  --from-date 2024-01-01T00:00:00Z \
+  --to-date 2024-12-31T23:59:59Z \
+  --output-file btcusdt-1m-um-2024.json --jobs 16
+
+# Spot klines instead of USD-M futures.
+download-ticks fetch --venue spot --symbol BTCUSDT --interval 1h \
+  --from-date 2024-01-01T00:00:00Z \
+  --to-date 2024-01-02T00:00:00Z \
+  --output-file btcusdt-1h-spot.json
+
+# Gate.io spot klines.
+download-ticks fetch --market gate --symbol BTC_USDT --interval 1m \
+  --from-date 2024-01-15T00:00:00Z \
+  --to-date 2024-01-15T23:59:59Z \
+  --output-file btcusdt-1m-gate.json
+
+# Inspect a downloaded file.
+download-ticks info --input-file btcusdt-1m-um-2024.json
 ```
 
-The stored rows are the exchange's raw JSON arrays, not a re-serialised struct:
-prices keep their original strings and precision.
+Gate.io serves a limited recent window (at most 10,000 points); requests for
+older ranges are rejected by the API.
+
+### Options
 
 | flag | meaning |
 | --- | --- |
-| `--market binance\|gate` | exchange family |
+| `-m, --market binance\|gate` | exchange family, default `binance` |
 | `--venue um\|spot` | Binance venue, default `um`; Gate.io is spot-only |
-| `--symbol`, `--interval` | pair and kline interval (`1m`, `1h`, `1d`, ...) |
-| `--from-date`, `--to-date` | inclusive RFC 3339 range, UTC |
-| `--output-file` | JSON array destination; written atomically |
-| `--jobs N` | bounded concurrency, default 8 |
-| `--retries N` | retries per request after the first attempt, default 3 |
-| `--verbose` | progress bar |
+| `-s, --symbol` | pair symbol (`BTCUSDT`, `BTC_USDT`, ...) |
+| `-i, --interval` | kline interval (`1m`, `5m`, `1h`, `1d`, `1M`, ...) |
+| `-f, --from-date` | inclusive start, RFC 3339 UTC |
+| `-t, --to-date` | inclusive end, RFC 3339 UTC |
+| `-o, --output-file` | JSON array destination; written atomically |
+| `-j, --jobs N` | maximum requests in flight, default 8 |
+| `-r, --retries N` | retries per request after the first attempt, default 3 |
+| `-v, --verbose` | progress bar |
 
-### Target CLI
+Without a date range the exchange's default page (up to 1,000 candles) is
+fetched. Without `--output-file` the data is downloaded and counted but not
+stored.
 
-The forms below are the target interface for the full data spine.
+## Output format
 
-#### Fetch
+Each output file is one JSON array. Every element is the exchange's raw kline
+row:
 
-```sh
-# 1-minute klines for one day
-download-ticks fetch --market um --symbol BTCUSDT --kind klines \
-  --interval 1m --from 2024-01-15 --to 2024-01-15 --out data
-
-# aggregated trades for the same day
-download-ticks fetch --market um --symbol BTCUSDT --kind aggTrades \
-  --from 2024-01-15 --to 2024-01-15 --out data
-
-# aggregate depth bands (~30 s)
-download-ticks fetch --market um --symbol BTCUSDT --kind bookDepth \
-  --from 2024-01-15 --to 2024-01-15 --out data
-
-# best bid/ask updates
-download-ticks fetch --market um --symbol BTCUSDT --kind bookTicker \
-  --from 2024-01-15 --to 2024-01-15 --out data
-
-# funding stamps
-download-ticks fetch --market um --symbol BTCUSDT --kind funding \
-  --from 2019-09-08 --to 2026-11-01 --out data
+```json
+[
+  [1704067200000, "42314.00000000", "42350.00000000", "42200.00000000", "42320.00000000", "10.50000000", 1704067259999, "444000.00000000", 120, "5.00000000", "211000.00000000", "0"]
+]
 ```
 
-Target options:
+- Binance rows have 12 columns: `open_time, open, high, low, close, volume,
+  close_time, quote_volume, trades, taker_buy_base, taker_buy_quote, ignore`.
+- Gate.io rows have 8 columns: `time, quote_volume, close, high, low, open,
+  base_volume, window`.
 
-| flag | meaning |
-| --- | --- |
-| `--source auto\|vision\|rest` | `auto` uses Vision for closed days, REST for recent |
-| `--from`, `--to` | inclusive date range, UTC |
-| `--resume` | skip objects already verified in the manifest |
-| `--verify` | checksum and decode each object after download |
-| `--best-effort` | record failures and exit 0; default is fail-fast |
-| `--out DIR` | dataset root |
+The `info` command prints the row count and covered range without rewriting the
+file.
 
-### Concurrency and durability
+## Concurrency and durability
 
 `fetch` uses one Tokio task per URL and keeps a sliding window of at most
 `--jobs` tasks in flight. Concurrency is bounded by construction (no shared
 semaphore), the work is spread over the runtime's worker threads, and dropping
 the `JoinSet` on failure aborts every outstanding request.
 
-Transient failures (408, 429, 5xx, connection and timeout errors) are retried
-with exponential backoff and jitter; `Retry-After` is honoured. Chunks are
-written in request order as soon as the preceding chunk is available, so memory
-does not grow with the size of the range. The output is a `.part` file while it
-is being written and is renamed into place only after the JSON array is closed.
+Transient failures are retried with exponential backoff and jitter; a
+`Retry-After` response header is honoured. Completed chunks are written in
+request order, and the destination is renamed into place only after the JSON
+array is closed. A failed request or a returned error therefore leaves no
+partial dataset at the requested path; an abrupt kill may leave a `.part` file,
+which is never mistaken for the final dataset.
 
-### Verify
-
-```sh
-download-ticks verify --manifest data/manifest.json
-```
-
-Checks checksums, row counts, monotonic timestamps, duplicate ids, crossed
-books, kline grid gaps, funding stamps, and the recomputed `dataset_id`. Exits
-non-zero on any error.
-
-### Info
-
-```sh
-download-ticks info --manifest data/manifest.json
-```
-
-Prints range, row counts, bytes, gaps, duplicates, and the dataset id.
-
-## Output layout
-
-```text
-data/
-  manifest.json
-  raw/binance/um/BTCUSDT/
-    klines/1m/BTCUSDT-1m-2024-01-15.zip
-    aggTrades/BTCUSDT-aggTrades-2024-01-15.zip
-    bookTicker/BTCUSDT-bookTicker-2024-01-15.zip
-    bookDepth/BTCUSDT-bookDepth-2024-01-15.zip
-  tape/binance/um/BTCUSDT/2024-01-15.jsonl.zst
-  funding/binance/um/BTCUSDT.csv
-```
-
-`raw/` is immutable and checksummed. `tape/` is derived from raw and can be
-rebuilt. `manifest.json` is the dataset identity.
-
-The manifest schema and the canonical event format are in the `trad` repository:
-[`docs/data-contract.md`](https://github.com/raonagos/trad/blob/main/docs/data-contract.md).
-
-## Guarantees
-
-- **Resumable.** A run interrupted at any object resumes from the verified
-  manifest and does not re-fetch completed bytes.
-- **Idempotent.** A second run over the same range adds zero rows and zero
-  bytes; a checksum mismatch is quarantined, never overwritten.
-- **Atomic.** `.part` file, then rename. No half-written object is visible.
-- **Checksummed.** Provider `CHECKSUM` verified before decode; the manifest
-  records the SHA-256 of the stored bytes.
-- **No silent gaps.** A missing object or a missing interval is a row in
-  `gaps[]`, not a skipped chunk.
-- **No interpolation.** A gap is data. The consumer decides what to do.
-- **Polite.** Bounded concurrency, retry with backoff on 429/5xx, no retry on
-  4xx, per-host rate limit.
-- **Deterministic.** The same inputs and tool commit rebuild the same event
-  order and the same `dataset_id`.
-
-## Coverage
-
-| product | spot | USD-M futures | note |
-| --- | --- | --- | --- |
-| klines | yes | yes | daily and monthly |
-| aggTrades | yes | yes | daily and monthly |
-| bookTicker | yes | yes | best bid/ask only |
-| bookDepth | no | yes | aggregate ±1..5% bands, ~30 s |
-| funding | no | yes | 8-hour stamps |
-
-USD-M listing dates: BTCUSDT 2019-09, ETHUSDT 2019-11, BNBUSDT 2020-02. There is
-no L2 before those dates. Historical full-depth spot data is not publicly
-archived; a live recorder is the only way to start collecting it.
-
-Source URL patterns and file formats: [`docs/data-sources.md`](docs/data-sources.md).
+There is no resume or manifest yet: a run always starts from the beginning of
+the requested range. Gaps in the exchange data are preserved as gaps; they are
+never filled or interpolated.
 
 ## Roadmap
 
-1. **Build and CLI skeleton** — done: `rustls`, `fetch`/`info`, bounded and
-   retrying REST downloader. `verify` and the manifest are still pending.
-2. **Vision client** — daily/monthly objects, checksum, range planning,
-   resumable download.
-3. **Decoders** — klines, aggTrades, bookTicker, bookDepth, funding; canonical
-   event tape; no-lookahead ordering. `bookDepth` is aggregate bands, not a
-   ladder.
-4. **Verify** — all checks in the data contract, including a deliberate
-   corruption test.
-5. **Backfill** — BTC/ETH/BNB UM, data card, one-month acceptance before the
-   full range.
-6. **Live recorder (optional)** — only if a full ladder or spot depth is needed;
-   not part of the first milestone.
+1. **Bulk archives.** Download Binance Vision daily/monthly ZIPs with their
+   `CHECKSUM` files for large backfills instead of paginating REST.
+2. **More products.** Aggregated trades, book ticker, aggregate book depth, and
+   funding rates.
+3. **Dataset manifest and verification.** Record source, range, checksums, row
+   counts, and gaps; add a `verify` command.
+4. **Resume and idempotency.** Skip objects already present and verified.
+5. **More exchanges and venues.**
+
+Reference notes for archive layouts and schemas are in
+[`docs/data-sources.md`](docs/data-sources.md).
 
 ## Non-goals
 
-- No trading, no keys, no order endpoints.
-- No data vendor with a key.
-- No interpolation, no synthetic bars, no “cleanup” that changes a price.
+- No live trading, exchange keys, or order endpoints.
+- No interpolation, synthetic bars, or price "cleanup".
 - No upload of market data.
 
 ## Development
 
 ```sh
-cargo fmt
+cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --release
 ```
 
-A change to a stored format or a manifest field is a breaking change: bump the
-schema and say so in the pull request.
+## Contributing
+
+Issues and pull requests are welcome.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
