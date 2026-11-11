@@ -1,6 +1,6 @@
 [package]
 name = "download-ticks"
-version = "1.7.0"
+version = "1.8.0"
 edition = "2024"
 authors = ["tetuaoro <65575727+tetuaoro@users.noreply.github.com>"]
 description = "Fetch, verify, and normalise Binance klines, trades, book, and funding."
@@ -12,12 +12,9 @@ license = "MIT"
 anyhow = "1.0.100"
 thiserror = "2.0.17"
 serde_json = "1.0.145"
-serde-this-or-that = "0.5.0"
 tokio = { version = "1.48.0", features = ["full"] }
 clap = { version = "4.5.49", features = ["derive"] }
 chrono = { version = "0.4.42", features = ["serde"] }
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }
-futures = "0.3.31"
-serde_with = "3.16.0"
 indicatif = "0.18.3"

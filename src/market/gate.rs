@@ -1,29 +1,27 @@
-#![allow(unused)]
-
-use chrono::{DateTime, Utc, serde::ts_seconds};
-use serde::{Deserialize, de::Error as DeError};
-use serde_this_or_that::{as_bool, as_f64};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 
 use super::{Endpoint, Kline};
-use crate::{cli::Command, errors::Error, utils::split_intervals};
+use crate::{cli::Command, utils::split_intervals};
 
 /// A wrapper for the Gate.io exchange configuration.
 pub struct Gate<'b>(&'b Command);
 
 impl<'b> Gate<'b> {
-    const BASE_URL: &'b str = "https://api.gateio.ws/api/v4/spot/candlesticks";
+    const BASE_URL: &'static str = "https://api.gateio.ws/api/v4/spot/candlesticks";
 
     pub fn build(command: &'b Command) -> Self {
         Self(command)
     }
 }
 
-impl<'b> Endpoint<'b> for Gate<'b> {
+impl Endpoint for Gate<'_> {
     fn urls(&self) -> Vec<String> {
         let symbol = &self.0.symbol;
         let interval = &self.0.interval;
         let burl = Self::BASE_URL;
-        let mut url = format!("{burl}?currency_pair={symbol}&interval={interval}");
+        let mut url = format!("{burl}?currency_pair={symbol}&interval={interval}&limit=1000");
 
         if let (Some(start), Some(end)) = (self.0.from_date, self.0.to_date) {
             let datetimes = split_intervals(start, end, interval);
@@ -42,55 +40,71 @@ impl<'b> Endpoint<'b> for Gate<'b> {
             url = format!("{url}&from={}", start.timestamp());
         } else if let (None, Some(end)) = (self.0.from_date, self.0.to_date) {
             url = format!("{url}&to={}", end.timestamp());
-        } else {
-            url = format!("{url}&limit=1000");
         }
         vec![url]
     }
 }
 
-/// Represents a single candlestick (kline) from Gate.
-#[derive(Debug, Deserialize)]
+/// A single candlestick (kline) from Gate.io.
+///
+/// As with Binance, the raw JSON row is kept verbatim. Gate only reports the
+/// candle's open time, so the close time mirrors it.
+#[derive(Debug, Clone)]
 pub struct GateKline {
-    #[serde(rename = "0", deserialize_with = "to_datetime")]
-    time: DateTime<Utc>,
-    #[serde(rename = "1", deserialize_with = "as_f64")]
-    quote_volume: f64,
-    #[serde(rename = "2", deserialize_with = "as_f64")]
-    close_price: f64,
-    #[serde(rename = "3", deserialize_with = "as_f64")]
-    high_price: f64,
-    #[serde(rename = "4", deserialize_with = "as_f64")]
-    low_price: f64,
-    #[serde(rename = "5", deserialize_with = "as_f64")]
-    open_price: f64,
-    #[serde(rename = "6", deserialize_with = "as_f64")]
-    base_volume: f64,
-    #[serde(rename = "6", deserialize_with = "as_bool")]
-    window: bool,
+    open_time: DateTime<Utc>,
+    raw: Vec<Value>,
+}
+
+impl<'de> Deserialize<'de> for GateKline {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Vec::<Value>::deserialize(deserializer)?;
+        let open_time = raw
+            .first()
+            .and_then(timestamp_seconds)
+            .and_then(DateTime::<Utc>::from_timestamp_secs)
+            .ok_or_else(|| serde::de::Error::custom("invalid Gate.io kline timestamp"))?;
+
+        Ok(Self { open_time, raw })
+    }
+}
+
+impl Serialize for GateKline {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.raw.serialize(serializer)
+    }
 }
 
 impl Kline for GateKline {
     fn open_time(&self) -> DateTime<Utc> {
-        self.time
+        self.open_time
     }
 
     fn close_time(&self) -> DateTime<Utc> {
-        self.time
+        self.open_time
     }
 }
 
-/// Deserializes a string into a `DateTime<Utc>`.
-///
-/// This function supports timestamps in seconds.
-///
-/// # Errors
-/// Returns an error if the string cannot be parsed as an integer or if the timestamp is invalid.
-pub fn to_datetime<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let deserialize = String::deserialize(deserializer)?;
-    let timestamp = deserialize.parse::<i64>().map_err(DeError::custom)?;
-    DateTime::<Utc>::from_timestamp_secs(timestamp).ok_or_else(|| DeError::custom(Error::InvalidDatetime))
+fn timestamp_seconds(value: &Value) -> Option<i64> {
+    value.as_i64().or_else(|| value.as_str()?.parse::<i64>().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serialization_preserves_the_exchange_row_verbatim() {
+        let json = r#"["1704067200","1000.00000000","42320.5","42350.0","42200.0","42314.0","12.50000000","true"]"#;
+        let kline: GateKline = serde_json::from_str(json).unwrap();
+
+        assert_eq!(kline.open_time().timestamp(), 1_704_067_200);
+        assert_eq!(kline.close_time(), kline.open_time());
+        assert_eq!(serde_json::to_string(&kline).unwrap(), json);
+    }
 }
