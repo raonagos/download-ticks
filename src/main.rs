@@ -1,39 +1,37 @@
 //! A command-line tool to fetch and save candlestick (kline) data from exchanges.
 //!
-//! This tool allows you to download historical candlestick data from exchanges
-//! (e.g., Binance), split the time range into chunks (to respect API limits),
-//! and save the results to a JSON file.
-//!
-//! ## Features
-//! - Supports multiple exchanges.
-//! - Handles large time ranges by splitting them into smaller intervals.
-//! - Saves data in the original exchange format or a custom JSON structure.
+//! The downloader runs bounded concurrent requests on the Tokio runtime, streams
+//! completed chunks to a JSON array in request order, retries transient errors,
+//! and atomically publishes the output file.
 //!
 //! ## Usage
-//! The tool is designed to be flexible and easy to use. See the `cli` module for command-line options.
+//! The tool is designed to be flexible and easy to use. See the `cli` module for
+//! command-line options.
 
 mod cli;
+mod download;
 mod errors;
 mod market;
 mod utils;
 
-use futures::TryFutureExt;
-use futures::{StreamExt, stream};
+use std::time::Duration;
+
 use indicatif::{ProgressBar, ProgressStyle};
-use reqwest::Client;
-use serde_json::Value;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::cli::*;
+use crate::download::Downloader;
 use crate::errors::*;
 use crate::market::*;
 use crate::utils::*;
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::build()?;
     match &cli.command {
-        Commands::Info(command) => info(&command)?,
-        Commands::Fetch(command) => fetch(&command).await?,
+        Commands::Info(command) => info(command)?,
+        Commands::Fetch(command) => fetch(command).await?,
     }
 
     Ok(())
@@ -55,16 +53,9 @@ fn print_info<T: Kline>(data: &[T]) -> Result<()> {
     let duration = last_k.close_time() - first_k.open_time();
 
     let days = duration.num_days();
-    let hours = duration.num_hours();
-    let minutes = duration.num_minutes();
-
-    let duration = if minutes > 0 {
-        format!("{}D / {}H / {}m", separator(days, "_")?, separator(hours, "_")?, separator(minutes, "_")?)
-    } else if hours > 0 {
-        format!("{}D / {}H", separator(days, "_")?, separator(hours, "_")?)
-    } else {
-        format!("{}D", separator(days, "_")?)
-    };
+    let hours = duration.num_hours() % 24;
+    let minutes = duration.num_minutes() % 60;
+    let duration = format!("{}D / {}H / {}m", separator(days, "_")?, separator(hours, "_")?, separator(minutes, "_")?);
 
     println!(
         "
@@ -104,73 +95,90 @@ fn info(cmd: &InfoCommand) -> Result<()> {
     Err(Error::InvalidFile)
 }
 
-/// Fetches klines data from the specified exchange.
+/// Fetches kline data from the selected exchange.
 ///
 /// # Arguments
 /// * `cmd` - A reference to the command configuration.
 ///
 /// # Errors
-/// Returns an error if the fetch operation fails.
+/// Returns an error if the range is empty, a request fails after its retries,
+/// or the output cannot be written.
 async fn fetch(cmd: &Command) -> Result<()> {
-    let market: &dyn Endpoint = match cmd.market {
-        Market::Gate => &Gate::build(&cmd),
-        Market::Binance => &Binance::build(&cmd),
-    };
-    let urls = market.urls();
+    match cmd.market {
+        Market::Binance => run_fetch::<_, BinanceKline>(&Binance::build(cmd), cmd).await,
+        Market::Gate => run_fetch::<_, GateKline>(&Gate::build(cmd), cmd).await,
+    }
+}
 
-    println!("{}", urls[0]);
-
-    let progress_bar = if cmd.verbose {
-        let pb = ProgressBar::new(urls.len() as u64);
-        let style = ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta})\n{msg}")
-            .map_err(Error::from)?
-            .progress_chars("#>-");
-        pb.set_style(style);
-        Some(pb)
-    } else {
-        None
-    };
-
-    let client = Client::new();
-    let klines_stream = stream::iter(&urls)
-        .map(|url| {
-            let client = &client;
-            async move {
-                let response = client.get(url).send().map_err(Error::from).await?;
-                response.json::<Vec<Value>>().map_err(Error::from).await
-            }
-        })
-        .buffered(90);
-
-    let mut all_klines = Vec::with_capacity(urls.len() * 1000);
-    all_klines = klines_stream
-        .fold(all_klines, |mut arr, result| async {
-            match result {
-                Ok(klines) => {
-                    if let Some(pb) = &progress_bar {
-                        pb.inc(1);
-                    }
-                    arr.extend(klines);
-                }
-                Err(e) => {
-                    if let Some(pb) = &progress_bar {
-                        pb.abandon_with_message(e.to_string());
-                    }
-                }
-            }
-            arr
-        })
-        .await;
-
-    if let Some(filepath) = &cmd.output_file {
-        write_to_file(filepath, &all_klines)?;
+async fn run_fetch<E, T>(endpoint: &E, cmd: &Command) -> Result<()>
+where
+    E: Endpoint,
+    T: DeserializeOwned + Serialize + Kline + Send + 'static,
+{
+    let urls = endpoint.urls();
+    if urls.is_empty() {
+        return Err(Error::EmptyRange);
     }
 
-    if let Some(pb) = &progress_bar {
-        pb.finish_with_message("Download ticks done.");
-    } else {
-        println!("Download ticks done.");
+    let progress = progress_bar(urls.len(), cmd)?;
+    let downloader = Downloader::new(cmd.retries)?;
+    let result = downloader
+        .download::<T>(urls, usize::from(cmd.jobs), cmd.output_file.as_deref(), progress.as_ref())
+        .await;
+
+    let report = match result {
+        Ok(report) => report,
+        Err(error) => {
+            if let Some(progress) = &progress {
+                progress.abandon_with_message(error.to_string());
+            }
+            return Err(error);
+        }
+    };
+
+    if let Some(progress) = &progress {
+        progress.finish_and_clear();
+    }
+
+    println!(
+        "Downloaded {} rows in {} requests over {}.",
+        separator(report.rows, ",")?,
+        separator(report.requests, ",")?,
+        format_duration(report.elapsed),
+    );
+
+    if let (Some(first), Some(last)) = (report.first_open, report.last_close) {
+        println!("Range: {} .. {}", first.to_rfc3339(), last.to_rfc3339());
+    }
+
+    if let Some(path) = &cmd.output_file {
+        let bytes = std::fs::metadata(path)?.len();
+        println!("Wrote {} ({} bytes).", path.display(), separator(bytes, ",")?);
     }
 
     Ok(())
+}
+
+fn progress_bar(len: usize, cmd: &Command) -> Result<Option<ProgressBar>> {
+    if !cmd.verbose {
+        return Ok(None);
+    }
+
+    let progress = ProgressBar::new(len as u64);
+    let style = ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta})\n{msg}")?
+        .progress_chars("#>-");
+
+    progress.set_style(style);
+    progress.set_message(format!("{} jobs, {} retries", cmd.jobs, cmd.retries));
+
+    Ok(Some(progress))
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs_f64();
+    if seconds < 60.0 {
+        format!("{seconds:.1}s")
+    } else {
+        format!("{}m {:02}s", duration.as_secs() / 60, duration.as_secs() % 60)
+    }
 }

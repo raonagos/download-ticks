@@ -13,6 +13,6 @@ pub trait Kline {
 }
 
 /// Trait to compute urls.
-pub trait Endpoint<'m> {
+pub trait Endpoint {
     fn urls(&self) -> Vec<String>;
 }

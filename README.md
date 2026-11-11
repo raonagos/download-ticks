@@ -10,10 +10,13 @@ verifies, and normalises the coupled tape that `trad` trains and scores on:
 It is resumable and idempotent. It never interpolates a gap, never silently
 drops a failed chunk, and writes a manifest that identifies the dataset.
 
-> **Status 2026-11-10.** The current code fetches klines only, through REST.
-> The TLS build now uses `rustls` and no longer needs OpenSSL. It has no
-> checksum/resume/verify path and ignores failed chunks. This README defines
-> the target. The rewrite lands in this repository's PR, one step at a time.
+> **Status 2026-11-11.** The current code fetches klines only, through REST.
+> The TLS build uses `rustls` and no longer needs OpenSSL. Downloads run as a
+> bounded `JoinSet` (one Tokio task per request), retry transient failures with
+> exponential backoff, stream chunks to the output in request order, and publish
+> the file with an atomic rename. There is still no checksum/resume/verify path
+> and no Vision archive client. This README defines the target. The rewrite
+> lands in this repository's PR, one step at a time.
 
 ## Why it exists
 
@@ -34,15 +37,48 @@ cargo build --release
 cargo test  --release
 ```
 
-`reqwest` must use `rustls-tls`; the current `native-tls` build fails when
-OpenSSL headers are absent. The rewrite removes that dependency from the
-default build.
+`reqwest` uses `rustls-tls`; no OpenSSL headers are required.
 
 ## Commands
 
 The CLI is organised around a fetch, a verify, and a manifest.
 
-### Fetch
+### Current CLI
+
+The current build implements kline `fetch` and `info` over REST, for Binance
+(spot or USD-M) and Gate.io (spot). The `--kind`, `--source`, `--resume`,
+`--verify`, and `--out` forms in the target examples below are not parsed yet.
+
+```sh
+# One day of USD-M perpetual 1-minute klines, 16 requests in flight.
+download-ticks fetch --market binance --venue um --symbol BTCUSDT \
+  --interval 1m --from-date 2024-01-15T00:00:00Z \
+  --to-date 2024-01-15T23:59:59Z --output-file btcusdt-1m-2024-01-15.json \
+  --jobs 16
+
+# Inspect the stored JSON array.
+download-ticks info --input-file btcusdt-1m-2024-01-15.json
+```
+
+The stored rows are the exchange's raw JSON arrays, not a re-serialised struct:
+prices keep their original strings and precision.
+
+| flag | meaning |
+| --- | --- |
+| `--market binance\|gate` | exchange family |
+| `--venue um\|spot` | Binance venue, default `um`; Gate.io is spot-only |
+| `--symbol`, `--interval` | pair and kline interval (`1m`, `1h`, `1d`, ...) |
+| `--from-date`, `--to-date` | inclusive RFC 3339 range, UTC |
+| `--output-file` | JSON array destination; written atomically |
+| `--jobs N` | bounded concurrency, default 8 |
+| `--retries N` | retries per request after the first attempt, default 3 |
+| `--verbose` | progress bar |
+
+### Target CLI
+
+The forms below are the target interface for the full data spine.
+
+#### Fetch
 
 ```sh
 # 1-minute klines for one day
@@ -66,7 +102,7 @@ download-ticks fetch --market um --symbol BTCUSDT --kind funding \
   --from 2019-09-08 --to 2026-11-01 --out data
 ```
 
-Common options:
+Target options:
 
 | flag | meaning |
 | --- | --- |
@@ -75,8 +111,20 @@ Common options:
 | `--resume` | skip objects already verified in the manifest |
 | `--verify` | checksum and decode each object after download |
 | `--best-effort` | record failures and exit 0; default is fail-fast |
-| `--jobs N` | bounded concurrency, default 4 |
 | `--out DIR` | dataset root |
+
+### Concurrency and durability
+
+`fetch` uses one Tokio task per URL and keeps a sliding window of at most
+`--jobs` tasks in flight. Concurrency is bounded by construction (no shared
+semaphore), the work is spread over the runtime's worker threads, and dropping
+the `JoinSet` on failure aborts every outstanding request.
+
+Transient failures (408, 429, 5xx, connection and timeout errors) are retried
+with exponential backoff and jitter; `Retry-After` is honoured. Chunks are
+written in request order as soon as the preceding chunk is available, so memory
+does not grow with the size of the range. The output is a `.part` file while it
+is being written and is renamed into place only after the JSON array is closed.
 
 ### Verify
 
@@ -151,7 +199,8 @@ Source URL patterns and file formats: [`docs/data-sources.md`](docs/data-sources
 
 ## Roadmap
 
-1. **Build and CLI skeleton** — `rustls`, `fetch/verify/info`, manifest types.
+1. **Build and CLI skeleton** — done: `rustls`, `fetch`/`info`, bounded and
+   retrying REST downloader. `verify` and the manifest are still pending.
 2. **Vision client** — daily/monthly objects, checksum, range planning,
    resumable download.
 3. **Decoders** — klines, aggTrades, bookTicker, bookDepth, funding; canonical

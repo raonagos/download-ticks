@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use crate::errors::{Error, Result};
 
 /// Supported market to fetch the data.
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Market {
     Gate,
     Binance,
@@ -22,40 +22,65 @@ impl fmt::Display for Market {
     }
 }
 
+/// Binance venue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Venue {
+    /// USD-M perpetual futures.
+    Um,
+    /// Spot.
+    Spot,
+}
+
 /// Supported time intervals for klines.
 #[derive(Debug, Clone, ValueEnum)]
 pub enum Interval {
     /// 1 second
+    #[value(name = "1s", alias = "s1")]
     S1,
     /// 1 minute
+    #[value(name = "1m", alias = "m1")]
     M1,
     /// 3 minutes
+    #[value(name = "3m", alias = "m3")]
     M3,
     /// 5 minutes
+    #[value(name = "5m", alias = "m5")]
     M5,
     /// 15 minutes
+    #[value(name = "15m", alias = "m15")]
     M15,
     /// 30 minutes
+    #[value(name = "30m", alias = "m30")]
     M30,
     /// 1 hour
+    #[value(name = "1h", alias = "h1")]
     H1,
     /// 2 hours
+    #[value(name = "2h", alias = "h2")]
     H2,
     /// 4 hours
+    #[value(name = "4h", alias = "h4")]
     H4,
     /// 6 hours
+    #[value(name = "6h", alias = "h6")]
     H6,
     /// 8 hours
+    #[value(name = "8h", alias = "h8")]
     H8,
     /// 12 hours
+    #[value(name = "12h", alias = "h12")]
     H12,
     /// 1 day
+    #[value(name = "1d", alias = "d1")]
     D1,
     /// 3 days
+    #[value(name = "3d", alias = "d3")]
     D3,
     /// 1 week
+    #[value(name = "1w", alias = "w1")]
     W1,
     /// 1 month
+    #[value(name = "1M", alias = "mm1")]
     MM1,
 }
 
@@ -92,16 +117,23 @@ This tool fetches historical candlestick (kline) data from exchanges like Binanc
 You can specify a trading pair (e.g., BTCUSDT), time interval (e.g., 1m, 1h, 1d),
 and optional start/end dates. The data is saved to a JSON file if --output-file is provided.
 
+Requests run concurrently on the Tokio runtime, bounded by --jobs. Transient
+failures (429, 408, 5xx, timeouts) are retried with exponential backoff.
+Binance defaults to USD-M perpetual futures; pass --venue spot for spot klines.
+
 ## Supported Exchanges
 - Binance
 - Gate.io
 
 Examples:
-  Fetch 1-hour BTCUSDT klines for the last 1000 hours:
-    $ download-ticks fetch -s BTCUSDT -i h1
+  Fetch 1-hour BTCUSDT klines for the latest 1000 hours:
+    $ download-ticks fetch -s BTCUSDT -i 1h
 
-  Fetch 1-minute BTCUSDT klines from Jan 1, 2019, to Mar 1, 2019, and save to output.json:
-    $ download-ticks fetch -s BTCUSDT -i m1 --from-date '2019-01-01T00:00:00Z' --to-date '2019-03-01T00:00:00Z' -o output.json
+  Fetch 1-minute BTCUSDT klines from Jan 1 to Mar 1, 2019, and save to output.json:
+    $ download-ticks fetch -s BTCUSDT -i 1m --from-date '2019-01-01T00:00:00Z' --to-date '2019-03-01T00:00:00Z' -o output.json
+
+  Fetch a full year with 16 concurrent requests:
+    $ download-ticks fetch -s BTCUSDT -i 1m --from-date '2024-01-01T00:00:00Z' --to-date '2024-12-31T23:59:59Z' -j 16 -o btcusdt-1m-2024.json
 
   Show information of output.json file:
     $ download-ticks info -f output.json
@@ -115,15 +147,15 @@ pub struct Cli {
 impl Cli {
     pub fn build() -> Result<Self> {
         let cmd = Self::parse();
-        match &cmd.command {
-            Commands::Fetch(cmd) => {
-                if let (Some(from_date), Some(to_date)) = (cmd.from_date, cmd.to_date) {
-                    if to_date < from_date {
-                        return Err(Error::InvalidDatetime);
-                    }
-                }
+        if let Commands::Fetch(cmd) = &cmd.command {
+            if let (Some(from_date), Some(to_date)) = (cmd.from_date, cmd.to_date)
+                && to_date < from_date
+            {
+                return Err(Error::InvalidDatetime);
             }
-            _ => (),
+            if cmd.market == Market::Gate && cmd.venue.is_some() {
+                return Err(Error::UnsupportedVenue);
+            }
         }
         Ok(cmd)
     }
@@ -144,6 +176,10 @@ pub struct Command {
     #[arg(short, long, default_value_t = Market::Binance)]
     pub market: Market,
 
+    /// Binance venue. Defaults to USD-M futures; Gate.io is spot-only.
+    #[arg(long, value_enum)]
+    pub venue: Option<Venue>,
+
     /// The trading pair symbol (e.g., BTCUSDT, ETHUSDT).
     #[arg(short, long)]
     pub symbol: String,
@@ -163,10 +199,16 @@ pub struct Command {
     /// Output file path to save the klines in JSON format.
     #[arg(short, long)]
     pub output_file: Option<PathBuf>,
-    // /// Re-try to get ticks from marketplace.
-    // #[arg(short, long, default_value = "3")]
-    // pub retry_counter: u8,
-    /// Print progress status. Usefull if you get `from` and `to` dates.
+
+    /// Maximum number of requests in flight.
+    #[arg(short = 'j', long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=64))]
+    pub jobs: u16,
+
+    /// Number of retries per request after the first attempt.
+    #[arg(short = 'r', long, default_value_t = 3, value_parser = clap::value_parser!(u16).range(0..=10))]
+    pub retries: u16,
+
+    /// Print progress status. Useful when a date range is given.
     #[arg(short, long)]
     pub verbose: bool,
 }

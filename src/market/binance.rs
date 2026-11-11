@@ -1,28 +1,35 @@
-#![allow(unused)]
-
-use chrono::{DateTime, Utc, serde::ts_milliseconds};
-use serde::Deserialize;
-use serde_this_or_that::{as_f64, as_u64};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 
 use super::{Endpoint, Kline};
-use crate::{cli::Command, utils::split_intervals};
+use crate::cli::{Command, Venue};
+use crate::utils::split_intervals;
 
 /// A wrapper for the Binance exchange configuration.
 pub struct Binance<'b>(&'b Command);
 
 impl<'b> Binance<'b> {
-    const BASE_URL: &'b str = "https://api.binance.com/api/v3/klines";
+    const SPOT_URL: &'static str = "https://api.binance.com/api/v3/klines";
+    const UM_URL: &'static str = "https://fapi.binance.com/fapi/v1/klines";
 
     pub fn build(command: &'b Command) -> Self {
         Self(command)
     }
+
+    fn base_url(&self) -> &'static str {
+        match self.0.venue.unwrap_or(Venue::Um) {
+            Venue::Um => Self::UM_URL,
+            Venue::Spot => Self::SPOT_URL,
+        }
+    }
 }
 
-impl<'b> Endpoint<'b> for Binance<'b> {
+impl Endpoint for Binance<'_> {
     fn urls(&self) -> Vec<String> {
         let symbol = &self.0.symbol;
         let interval = &self.0.interval;
-        let burl = Self::BASE_URL;
+        let burl = self.base_url();
         let mut url = format!("{burl}?symbol={symbol}&interval={interval}&limit=1000");
 
         if let (Some(start), Some(end)) = (self.0.from_date, self.0.to_date) {
@@ -47,33 +54,46 @@ impl<'b> Endpoint<'b> for Binance<'b> {
     }
 }
 
-/// Represents a single candlestick (kline) from binance.
-#[derive(Debug, Deserialize)]
+/// A single candlestick (kline) from Binance.
+///
+/// The raw JSON row is kept verbatim so that the stored dataset preserves the
+/// exchange's own strings and precision. Only the two timestamps needed for
+/// progress reporting and `info` are parsed.
+#[derive(Debug, Clone)]
 pub struct BinanceKline {
-    #[serde(rename = "0", with = "ts_milliseconds")]
     open_time: DateTime<Utc>,
-    #[serde(rename = "1", deserialize_with = "as_f64")]
-    open_price: f64,
-    #[serde(rename = "2", deserialize_with = "as_f64")]
-    high_price: f64,
-    #[serde(rename = "3", deserialize_with = "as_f64")]
-    low_price: f64,
-    #[serde(rename = "4", deserialize_with = "as_f64")]
-    close_price: f64,
-    #[serde(rename = "5", deserialize_with = "as_f64")]
-    volume: f64,
-    #[serde(rename = "6", with = "ts_milliseconds")]
     close_time: DateTime<Utc>,
-    #[serde(rename = "7", deserialize_with = "as_f64")]
-    quote_asset_volume: f64,
-    #[serde(rename = "8")]
-    number_of_trades: u64,
-    #[serde(rename = "9", deserialize_with = "as_f64")]
-    taker_buy_base_volume: f64,
-    #[serde(rename = "10", deserialize_with = "as_f64")]
-    taker_buy_quote_volume: f64,
-    #[serde(rename = "11", deserialize_with = "as_u64")]
-    ignore: u64,
+    raw: Vec<Value>,
+}
+
+impl<'de> Deserialize<'de> for BinanceKline {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Vec::<Value>::deserialize(deserializer)?;
+        let open_time = raw
+            .first()
+            .and_then(timestamp_millis)
+            .and_then(DateTime::<Utc>::from_timestamp_millis)
+            .ok_or_else(|| serde::de::Error::custom("invalid Binance kline open time"))?;
+        let close_time = raw
+            .get(6)
+            .and_then(timestamp_millis)
+            .and_then(DateTime::<Utc>::from_timestamp_millis)
+            .ok_or_else(|| serde::de::Error::custom("invalid Binance kline close time"))?;
+
+        Ok(Self { open_time, close_time, raw })
+    }
+}
+
+impl Serialize for BinanceKline {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.raw.serialize(serializer)
+    }
 }
 
 impl Kline for BinanceKline {
@@ -83,5 +103,24 @@ impl Kline for BinanceKline {
 
     fn close_time(&self) -> DateTime<Utc> {
         self.close_time
+    }
+}
+
+fn timestamp_millis(value: &Value) -> Option<i64> {
+    value.as_i64().or_else(|| value.as_str()?.parse::<i64>().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serialization_preserves_the_exchange_row_verbatim() {
+        let json = r#"[1704067200000,"42314.00000000","42350.00000000","42200.00000000","42320.00000000","10.50000000",1704067259999,"444000.00000000",120,"5.00000000","211000.00000000","0"]"#;
+        let kline: BinanceKline = serde_json::from_str(json).unwrap();
+
+        assert_eq!(kline.open_time().timestamp_millis(), 1_704_067_200_000);
+        assert_eq!(kline.close_time().timestamp_millis(), 1_704_067_259_999);
+        assert_eq!(serde_json::to_string(&kline).unwrap(), json);
     }
 }

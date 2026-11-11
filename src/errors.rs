@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Custom error type for the application.
@@ -11,6 +13,21 @@ pub enum Error {
 
     #[error("Invalid given datetime.")]
     InvalidDatetime,
+
+    #[error("The requested range does not contain any interval.")]
+    EmptyRange,
+
+    #[error("--venue only applies to Binance; Gate.io is spot-only.")]
+    UnsupportedVenue,
+
+    #[error("Cannot derive an output file name from {0}.")]
+    InvalidOutputPath(PathBuf),
+
+    #[error("HTTP {status} while fetching {url}")]
+    HttpStatus { status: reqwest::StatusCode, url: String },
+
+    #[error("A download task failed: {0}")]
+    Join(#[from] tokio::task::JoinError),
 
     #[error("{0}")]
     Io(#[from] std::io::Error),

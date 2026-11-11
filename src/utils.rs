@@ -1,8 +1,10 @@
-use std::{fs::File, io::BufReader, path::PathBuf};
+use std::fs::File;
+use std::io::BufReader;
+use std::path::Path;
 
 use chrono::{DateTime, Duration, Utc};
-use serde::{Serialize, de::DeserializeOwned};
-use serde_json::{from_reader, to_writer};
+use serde::de::DeserializeOwned;
+use serde_json::from_reader;
 
 use crate::{Error, Interval, Result};
 
@@ -50,22 +52,13 @@ pub fn split_intervals(start: DateTime<Utc>, end: DateTime<Utc>, interval: &Inte
 }
 
 /// Reads candlestick data from a file containing serialized Kline data.
-pub fn read_data_from_file<T>(path: &PathBuf) -> Result<Vec<T>>
+pub fn read_data_from_file<T>(path: &Path) -> Result<Vec<T>>
 where
     T: DeserializeOwned,
 {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     from_reader(reader).map_err(Error::from)
-}
-
-/// Writes candlestick data to a file.
-pub fn write_to_file<T>(path: &PathBuf, klines: &[T]) -> Result<()>
-where
-    T: Serialize,
-{
-    let file = File::create(path)?;
-    to_writer(file, &klines).map_err(Error::from)
 }
 
 /// Number separator
@@ -78,4 +71,39 @@ pub fn separator<T: ToString>(num: T, sep: &str) -> Result<String> {
         .collect::<std::result::Result<Vec<&str>, _>>()
         .map(|num_sep| num_sep.join(sep))
         .map_err(Error::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone;
+
+    use super::*;
+
+    #[test]
+    fn split_intervals_covers_the_range_without_overlap() {
+        let start = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2024, 1, 3, 0, 0, 0).unwrap();
+        let chunks = split_intervals(start, end, &Interval::M1);
+
+        assert_eq!(chunks.first().unwrap().0, start);
+        assert_eq!(chunks.last().unwrap().1, end);
+        for pair in chunks.windows(2) {
+            assert_eq!(pair[1].0, pair[0].1 + Duration::minutes(1));
+        }
+        for (chunk_start, chunk_end) in &chunks {
+            assert!(chunk_start < chunk_end);
+        }
+    }
+
+    #[test]
+    fn split_intervals_returns_nothing_for_an_empty_range() {
+        let start = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        assert!(split_intervals(start, start, &Interval::M1).is_empty());
+    }
+
+    #[test]
+    fn separator_groups_digits() {
+        assert_eq!(separator(1_234_567u64, ",").unwrap(), "1,234,567");
+        assert_eq!(separator(42u64, ",").unwrap(), "42");
+    }
 }
