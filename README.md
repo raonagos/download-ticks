@@ -156,6 +156,12 @@ cargo clippy --all-targets -- -D warnings
 cargo test --release
 ```
 
+## Releasing
+
+Releases are tag-driven. Push a tag `vX.Y.Z` that matches `Cargo.toml`; the
+`Publish` workflow runs the checks and publishes to crates.io. See
+[RELEASING.md](RELEASING.md) for the one-time trusted-publishing setup.
+
 ## Contributing
 
 Issues and pull requests are welcome.
