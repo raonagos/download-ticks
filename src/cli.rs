@@ -167,6 +167,114 @@ pub enum Commands {
     Fetch(Command),
     /// Display information about a JSON file containing klines.
     Info(InfoCommand),
+    /// Download raw archive objects from Binance Vision, verified by checksum.
+    Sync(SyncCommand),
+    /// Decode the raw objects into the canonical tape and write the manifest.
+    Build(BuildCommand),
+    /// Check a dataset against data-contract section 7.
+    Verify(VerifyCommand),
+    /// Fetch the funding series from the REST endpoint.
+    Funding(FundingCommand),
+}
+
+/// Command-line arguments for the archive sync.
+#[derive(Debug, Clone, Parser)]
+pub struct SyncCommand {
+    /// The trading pair symbol (e.g., BTCUSDT).
+    #[arg(short, long)]
+    pub symbol: String,
+
+    /// Kline interval of the archived objects.
+    #[arg(long, default_value = "1m")]
+    pub interval: String,
+
+    /// First day, inclusive (YYYY-MM-DD, UTC).
+    #[arg(long)]
+    pub from_date: String,
+
+    /// Last day, inclusive (YYYY-MM-DD, UTC).
+    #[arg(long)]
+    pub to_date: String,
+
+    /// Dataset root.
+    #[arg(long, default_value = "data")]
+    pub root: PathBuf,
+
+    /// Comma-separated products: klines,aggTrades,bookTicker,bookDepth.
+    #[arg(long, default_value = "klines,aggTrades,bookTicker,bookDepth")]
+    pub products: String,
+
+    /// Objects in flight.
+    #[arg(short = 'j', long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(1..=16))]
+    pub jobs: u16,
+
+    /// Retries per object after the first attempt.
+    #[arg(short = 'r', long, default_value_t = 3, value_parser = clap::value_parser!(u16).range(0..=10))]
+    pub retries: u16,
+
+    /// Print every object.
+    #[arg(short, long)]
+    pub verbose: bool,
+}
+
+/// Command-line arguments for the tape build.
+#[derive(Debug, Clone, Parser)]
+pub struct BuildCommand {
+    /// The trading pair symbol (e.g., BTCUSDT).
+    #[arg(short, long)]
+    pub symbol: String,
+
+    /// Kline interval of the archived objects.
+    #[arg(long, default_value = "1m")]
+    pub interval: String,
+
+    /// First day, inclusive (YYYY-MM-DD, UTC).
+    #[arg(long)]
+    pub from_date: String,
+
+    /// Last day, inclusive (YYYY-MM-DD, UTC).
+    #[arg(long)]
+    pub to_date: String,
+
+    /// Dataset root.
+    #[arg(long, default_value = "data")]
+    pub root: PathBuf,
+
+    /// Comma-separated products: klines,aggTrades,bookTicker,bookDepth.
+    #[arg(long, default_value = "klines,aggTrades,bookTicker,bookDepth")]
+    pub products: String,
+}
+
+/// Command-line arguments for verification.
+#[derive(Debug, Clone, Parser)]
+pub struct VerifyCommand {
+    /// Dataset root.
+    #[arg(long, default_value = "data")]
+    pub root: PathBuf,
+
+    /// Also decode every raw object again and compare its row count.
+    #[arg(long)]
+    pub deep: bool,
+}
+
+/// Command-line arguments for the funding series.
+#[derive(Debug, Clone, Parser)]
+pub struct FundingCommand {
+    /// The trading pair symbol (e.g., BTCUSDT).
+    #[arg(short, long)]
+    pub symbol: String,
+
+    /// First day, inclusive (YYYY-MM-DD, UTC). Defaults to the symbol listing.
+    #[arg(long)]
+    pub from_date: Option<String>,
+
+    /// Last day, inclusive (YYYY-MM-DD, UTC). Defaults to today.
+    #[arg(long)]
+    pub to_date: Option<String>,
+
+    /// Dataset root.
+    #[arg(long, default_value = "data")]
+    pub root: PathBuf,
 }
 
 /// Command-line arguments for fetching klines.

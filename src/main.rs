@@ -8,11 +8,18 @@
 //! The tool is designed to be flexible and easy to use. See the `cli` module for
 //! command-line options.
 
+mod archive;
+mod build;
 mod cli;
+mod decode;
 mod download;
 mod errors;
+mod funding;
+mod manifest;
 mod market;
+mod tape;
 mod utils;
+mod verify;
 
 use std::time::Duration;
 
@@ -20,6 +27,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::archive::{Archive, Product, Range};
 use crate::cli::*;
 use crate::download::Downloader;
 use crate::errors::*;
@@ -32,9 +40,165 @@ async fn main() -> anyhow::Result<()> {
     match &cli.command {
         Commands::Info(command) => info(command)?,
         Commands::Fetch(command) => fetch(command).await?,
+        Commands::Sync(command) => sync_archive(command).await?,
+        Commands::Build(command) => build_dataset(command)?,
+        Commands::Verify(command) => verify_dataset(command)?,
+        Commands::Funding(command) => fetch_funding(command).await?,
     }
 
     Ok(())
+}
+
+/// Parses the `--products` list.
+fn parse_products(value: &str) -> Result<Vec<Product>> {
+    let mut products = Vec::new();
+    for token in value.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let product = Product::parse(token).ok_or_else(|| Error::Manifest(format!("unknown product {token}")))?;
+        if !products.contains(&product) {
+            products.push(product);
+        }
+    }
+    if products.is_empty() {
+        return Err(Error::Manifest("no product selected".to_owned()));
+    }
+    Ok(products)
+}
+
+/// Downloads the raw archive objects and reports every outcome.
+async fn sync_archive(command: &SyncCommand) -> Result<()> {
+    let range = Range::parse(&command.from_date, &command.to_date)?;
+    let products = parse_products(&command.products)?;
+    let archive = Archive::new(&command.root, &command.symbol, &command.interval, command.retries)?;
+    let started = std::time::Instant::now();
+    let results = archive.sync(&products, range.from, range.to, usize::from(command.jobs)).await?;
+
+    let mut downloaded = 0usize;
+    let mut skipped = 0usize;
+    let mut missing = 0usize;
+    let mut failed = 0usize;
+    let mut bytes = 0u64;
+    for result in &results {
+        match result.outcome {
+            crate::archive::Outcome::Downloaded => downloaded += 1,
+            crate::archive::Outcome::Skipped => skipped += 1,
+            crate::archive::Outcome::Missing => missing += 1,
+            crate::archive::Outcome::Quarantined => failed += 1,
+        }
+        bytes += result.bytes;
+        if command.verbose || result.is_failure() {
+            println!(
+                "{} {} {:?} {} {} ({})",
+                result.date,
+                result.product.as_str(),
+                result.outcome,
+                build::human_bytes(result.bytes),
+                result.detail,
+                result.path.display()
+            );
+            if result.is_failure() {
+                println!("    actual sha256: {}", result.sha256);
+            }
+        }
+    }
+
+    println!(
+        "{} objects: {} downloaded, {} already present, {} missing, {} failed; {} in {}.",
+        results.len(),
+        downloaded,
+        skipped,
+        missing,
+        failed,
+        build::human_bytes(bytes),
+        format_elapsed(started.elapsed())
+    );
+
+    if failed > 0 {
+        return Err(Error::Manifest(format!(
+            "{failed} object(s) failed their checksum; see the quarantined files"
+        )));
+    }
+    Ok(())
+}
+
+/// Builds the tape and the manifest from the raw objects.
+fn build_dataset(command: &BuildCommand) -> Result<()> {
+    let range = Range::parse(&command.from_date, &command.to_date)?;
+    let products = parse_products(&command.products)?;
+    let commit = tool_commit();
+    let report = build::build(&command.root, &command.symbol, &command.interval, range, &products, &commit)?;
+    let manifest = &report.manifest;
+
+    println!(
+        "
+{} days, {} events, tape {} in {}.",
+        report.days,
+        separator(report.events, ",")?,
+        build::human_bytes(report.tape_bytes),
+        format_elapsed(std::time::Duration::from_millis(report.elapsed_ms as u64))
+    );
+    println!(
+        "manifest: {} objects, {} rows, {} raw, {} gaps",
+        manifest.totals.objects,
+        separator(manifest.totals.rows, ",")?,
+        build::human_bytes(manifest.totals.bytes),
+        manifest.totals.gaps
+    );
+    println!("dataset_id: {}", manifest.dataset_id);
+    Ok(())
+}
+
+/// Runs the contract's verification and exits non-zero on a failure.
+fn verify_dataset(command: &VerifyCommand) -> Result<()> {
+    let report = verify::verify(&command.root, command.deep)?;
+    for (name, ok, detail) in &report.checks {
+        println!("{} {name}: {detail}", if *ok { "ok  " } else { "FAIL" });
+    }
+    if report.failures.is_empty() {
+        println!(
+            "
+dataset verified."
+        );
+        Ok(())
+    } else {
+        Err(Error::Verify(format!("{} check(s) failed", report.failures.len())))
+    }
+}
+
+/// Fetches the funding series.
+async fn fetch_funding(command: &FundingCommand) -> Result<()> {
+    let from = match &command.from_date {
+        Some(value) => Range::parse(value, value)?.from,
+        None => chrono::NaiveDate::from_ymd_opt(2019, 9, 8).expect("listing"),
+    };
+    let to = match &command.to_date {
+        Some(value) => Range::parse(value, value)?.from,
+        None => chrono::Utc::now().date_naive() + chrono::Duration::days(1),
+    };
+    let from_ms = build::day_start_ms(from);
+    let to_ms = build::day_start_ms(to) + 86_400_000;
+    let stamps = funding::fetch(&command.root, &command.symbol, from_ms, to_ms).await?;
+    println!("{stamps} funding stamps, {} .. {}.", from, to);
+    Ok(())
+}
+
+/// The commit stamped into the manifest, when the tool runs from a checkout.
+fn tool_commit() -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|commit| !commit.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn format_elapsed(duration: std::time::Duration) -> String {
+    format_duration(duration)
 }
 
 /// Prints information about a collection of klines.

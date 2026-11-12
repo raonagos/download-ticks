@@ -46,4 +46,28 @@ pub enum Error {
 
     #[error("{0}")]
     Parse(#[from] std::num::ParseIntError),
+
+    #[error("zip: {0}")]
+    Zip(#[from] zip::result::ZipError),
+
+    #[error("archive {path} holds {members} members; exactly one CSV is expected")]
+    ArchiveShape { path: PathBuf, members: usize },
+
+    #[error("a decoding thread panicked")]
+    DecoderPanicked,
+
+    #[error("the tape consumer closed while an object was still decoding")]
+    ChannelClosed,
+
+    #[error("malformed CSV row")]
+    MalformedRow,
+
+    #[error("event ts {ts} is more than the reorder window behind {frontier}")]
+    OutOfOrder { ts: i64, frontier: i64 },
+
+    #[error("{0}")]
+    Manifest(String),
+
+    #[error("verification failed: {0}")]
+    Verify(String),
 }
