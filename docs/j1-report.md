@@ -71,9 +71,25 @@ So one month ≈ 7.5 GiB ≈ **3 h 45** of download, plus ~11 min of build and
 ~560 GiB, i.e. weeks at this rate: it needs a faster link or a smaller product
 set before it is scheduled.
 
+## A finding: the archive is not time-ordered
+
+The first three-day build failed on 2024-01-02 with a 23.6 h timestamp
+inversion. The cause is in the object, not the reader: `bookTicker` for that day
+interleaves two `update_id` streams (`3755…` and `3761…`), and the second one
+carries the last seconds of the day from line 361,605 onwards. Measured on the
+file: **180,805 adjacent inversions in 18,508,654 rows**, the worst 85,936,029 ms.
+
+A reorder window cannot absorb that, so a day is now decoded in parallel and
+sorted by `(ts, kind, id)` before it is written. The tape is what the contract
+says it is; the archive only supplied the rows. Consequence: a 20M-event day
+costs ~1.5 GiB of memory at build time, capped at 40M events.
+
+After the change, the three-day rehearsal (2024-01-01..03) builds in 64 s and
+verifies: 50,743,801 events, `dataset_id sha256:1104aaa4…`, no gaps.
+
 ## Limits
 
-- One asset, one venue, one day. ETH/BNB and the month are untouched.
+- One asset, one venue, three rehearsal days; the month was still downloading. ETH/BNB and the month are untouched.
 - `bookDepth` has no monthly object, so the sync is daily per product.
 - The `trad` replay loader does not exist yet; the tape is verified but nothing
   in `trad` reads it.

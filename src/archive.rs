@@ -82,14 +82,14 @@ impl Product {
         }
     }
 
-    /// The provider URL for one day.
-    pub fn url(self, symbol: &str, date: NaiveDate, interval: &str) -> String {
+    /// The provider URL under an explicit base (tests use a local server).
+    pub fn url_at(self, base: &str, symbol: &str, date: NaiveDate, interval: &str) -> String {
         let day = date.format("%Y-%m-%d");
         match self {
-            Product::Klines => format!("{VISION_BASE}/daily/klines/{symbol}/{interval}/{symbol}-{interval}-{day}.zip"),
-            Product::AggTrades => format!("{VISION_BASE}/daily/aggTrades/{symbol}/{symbol}-aggTrades-{day}.zip"),
-            Product::BookTicker => format!("{VISION_BASE}/daily/bookTicker/{symbol}/{symbol}-bookTicker-{day}.zip"),
-            Product::BookDepth => format!("{VISION_BASE}/daily/bookDepth/{symbol}/{symbol}-bookDepth-{day}.zip"),
+            Product::Klines => format!("{base}/daily/klines/{symbol}/{interval}/{symbol}-{interval}-{day}.zip"),
+            Product::AggTrades => format!("{base}/daily/aggTrades/{symbol}/{symbol}-aggTrades-{day}.zip"),
+            Product::BookTicker => format!("{base}/daily/bookTicker/{symbol}/{symbol}-bookTicker-{day}.zip"),
+            Product::BookDepth => format!("{base}/daily/bookDepth/{symbol}/{symbol}-bookDepth-{day}.zip"),
         }
     }
 
@@ -142,6 +142,7 @@ pub struct Archive<'a> {
     symbol: &'a str,
     interval: &'a str,
     retries: u32,
+    base: String,
 }
 
 impl<'a> Archive<'a> {
@@ -157,7 +158,15 @@ impl<'a> Archive<'a> {
             symbol,
             interval,
             retries: u32::from(retries),
+            base: VISION_BASE.to_owned(),
         })
+    }
+
+    /// Points the client at another base, for tests.
+    #[cfg(test)]
+    pub fn with_base(mut self, base: &str) -> Self {
+        self.base = base.trim_end_matches('/').to_owned();
+        self
     }
 
     /// Fetches every (product, day) pair, at most `jobs` at a time.
@@ -177,7 +186,8 @@ impl<'a> Archive<'a> {
                 let symbol = self.symbol.to_owned();
                 let interval = self.interval.to_owned();
                 let retries = self.retries;
-                tasks.spawn(async move { fetch_object(&client, &root, &symbol, &interval, product, date, retries).await });
+                let base = self.base.clone();
+                tasks.spawn(async move { fetch_object(&client, &root, &symbol, &interval, product, date, retries, &base).await });
             }
             let Some(joined) = tasks.join_next().await else {
                 break;
@@ -228,6 +238,9 @@ impl<'a> BTreeIter<'a> {
     }
 }
 
+// The client, the dataset layout and the object identity are all needed; the
+// alternative is a struct that only moves the same fields around.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_object(
     client: &Client,
     root: &Path,
@@ -236,9 +249,10 @@ async fn fetch_object(
     product: Product,
     date: NaiveDate,
     retries: u32,
+    base: &str,
 ) -> Result<ObjectResult> {
     let path = product.raw_path(root, symbol, date, interval);
-    let url = product.url(symbol, date, interval);
+    let url = product.url_at(base, symbol, date, interval);
 
     if path.exists() {
         let stored = sha256_file(&path)?;
@@ -489,11 +503,11 @@ mod tests {
     fn urls_match_the_documented_layout() {
         let day = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
         assert_eq!(
-            Product::Klines.url("BTCUSDT", day, "1m"),
+            Product::Klines.url_at(VISION_BASE, "BTCUSDT", day, "1m"),
             "https://data.binance.vision/data/futures/um/daily/klines/BTCUSDT/1m/BTCUSDT-1m-2024-01-15.zip"
         );
         assert_eq!(
-            Product::BookDepth.url("BTCUSDT", day, "1m"),
+            Product::BookDepth.url_at(VISION_BASE, "BTCUSDT", day, "1m"),
             "https://data.binance.vision/data/futures/um/daily/bookDepth/BTCUSDT/BTCUSDT-bookDepth-2024-01-15.zip"
         );
     }
@@ -537,5 +551,103 @@ mod tests {
         assert_eq!(seen.len(), 4);
         assert!(seen.contains(&(Product::Klines, from)));
         assert!(seen.contains(&(Product::BookTicker, to)));
+    }
+
+    /// A tiny HTTP server so the sync path is tested without the network.
+    async fn serve(routes: Vec<(String, Vec<u8>)>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let routes = routes.clone();
+                tokio::spawn(async move {
+                    let mut buffer = vec![0u8; 4096];
+                    let read = socket.read(&mut buffer).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                    let body = routes.iter().find(|(route, _)| *route == path).map(|(_, body)| body.clone());
+                    let response = match body {
+                        Some(body) => {
+                            let mut response = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).into_bytes();
+                            response.extend_from_slice(&body);
+                            response
+                        }
+                        None => b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec(),
+                    };
+                    let _ = socket.write_all(&response).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn sync_downloads_then_skips_then_quarantines() {
+        use sha2::{Digest, Sha256};
+
+        let payload = b"PK\x03\x04 not really a zip, but bytes are bytes".to_vec();
+        let digest = format!("{:x}", Sha256::digest(&payload));
+        let zip_route = "/daily/bookDepth/BTCUSDT/BTCUSDT-bookDepth-2024-01-15.zip".to_owned();
+        let checksum_route = format!("{zip_route}.CHECKSUM");
+        let base = serve(vec![
+            (zip_route.clone(), payload.clone()),
+            (
+                checksum_route.clone(),
+                format!("{digest}  BTCUSDT-bookDepth-2024-01-15.zip\n").into_bytes(),
+            ),
+        ])
+        .await;
+
+        let root = std::env::temp_dir().join(format!("archive-sync-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let date = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+
+        let archive = Archive::new(&root, "BTCUSDT", "1m", 1).unwrap().with_base(&base);
+
+        let first = archive.sync(&[Product::BookDepth], date, date, 1).await.unwrap();
+        assert_eq!(first[0].outcome, Outcome::Downloaded);
+        assert_eq!(first[0].sha256, digest);
+
+        // Idempotent: the same bytes are not fetched again.
+        let second = archive.sync(&[Product::BookDepth], date, date, 1).await.unwrap();
+        assert_eq!(second[0].outcome, Outcome::Skipped);
+
+        // A tampered object is quarantined, not overwritten or trusted.
+        let path = Product::BookDepth.raw_path(&root, "BTCUSDT", date, "1m");
+        fs::write(&path, b"tampered").unwrap();
+        let third = archive.sync(&[Product::BookDepth], date, date, 1).await.unwrap();
+        assert_eq!(third[0].outcome, Outcome::Quarantined);
+        assert!(!path.exists());
+        assert!(
+            fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains("quarantine"))
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_missing_object_is_reported_as_missing() {
+        let base = serve(Vec::new()).await;
+        let root = std::env::temp_dir().join(format!("archive-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let date = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+
+        let archive = Archive::new(&root, "BTCUSDT", "1m", 0).unwrap().with_base(&base);
+        let results = archive.sync(&[Product::Klines], date, date, 1).await.unwrap();
+        assert_eq!(results[0].outcome, Outcome::Missing);
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

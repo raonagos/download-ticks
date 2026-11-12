@@ -134,9 +134,12 @@ Guarantees:
   leaves a half object or a half manifest.
 - **No filled gaps.** A missing day, or a missing minute, is listed in the
   manifest and stays missing in the tape.
-- **Bounded memory.** Decoding streams each object on its own thread behind a
-  bounded channel and merges the day with a k-way heap; a 20-million-row
-  `bookTicker` day never sits in memory.
+- **A day is sorted, not assumed sorted.** The archive is not time-ordered: a
+  2024-01-02 `bookTicker` file interleaves two `update_id` streams and shows
+  180,805 adjacent timestamp inversions in 18.5M rows. A day is therefore
+  decoded in parallel, sorted by `(ts, kind, id)`, and only then written.
+  That costs ~1.5 GiB for a 20M-event day, with a 40M-event cap that fails
+  loudly instead of swapping.
 
 The tape is one JSON object per line, sorted by `(ts, kind, id)`, zstd
 compressed. Kinds: `trade`, `book_ticker`, `book_depth`, `kline`, `funding`.

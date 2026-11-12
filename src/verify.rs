@@ -248,7 +248,9 @@ fn scan_tape(path: &Path, counts: &mut std::collections::BTreeMap<String, u64>) 
     let decoder = BufReader::new(decoder);
     let mut last_ts = i64::MIN;
     let mut last_kind = 0u8;
-    let mut last_id: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    // The tape is sorted by (ts, kind, id), not by id: ids are collected and
+    // checked for uniqueness after the scan, never for monotonicity.
+    let mut ids: std::collections::BTreeMap<String, Vec<u64>> = std::collections::BTreeMap::new();
     let mut kline_minutes: Vec<i64> = Vec::new();
 
     for line in decoder.lines() {
@@ -271,12 +273,7 @@ fn scan_tape(path: &Path, counts: &mut std::collections::BTreeMap<String, u64>) 
         last_ts = ts;
         last_kind = rank;
 
-        let previous = last_id.insert(kind.to_owned(), id);
-        if let Some(previous) = previous
-            && id <= previous
-        {
-            return Err(crate::errors::Error::Verify(format!("{kind} id {id} after {previous}")));
-        }
+        ids.entry(kind.to_owned()).or_default().push(id);
 
         match kind {
             "trade" => {
@@ -319,6 +316,13 @@ fn scan_tape(path: &Path, counts: &mut std::collections::BTreeMap<String, u64>) 
         }
 
         *counts.entry(kind.to_owned()).or_default() += 1;
+    }
+
+    for (kind, mut kind_ids) in ids {
+        kind_ids.sort_unstable();
+        if let Some(pair) = kind_ids.windows(2).find(|pair| pair[0] == pair[1]) {
+            return Err(crate::errors::Error::Verify(format!("duplicate {kind} id {}", pair[0])));
+        }
     }
 
     Ok(kline_minutes)

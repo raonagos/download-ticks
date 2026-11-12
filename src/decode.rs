@@ -222,7 +222,6 @@ impl DecodeStats {
 
 /// A running decoder: a bounded channel and the thread feeding it.
 pub struct Decoder {
-    pub product: Product,
     pub rx: Receiver<Result<Event>>,
     pub handle: JoinHandle<Result<DecodeStats>>,
 }
@@ -245,7 +244,7 @@ pub fn spawn(product: Product, path: &Path, capacity: usize) -> Result<Decoder> 
     let handle = std::thread::Builder::new()
         .name(format!("decode-{}", product.as_str()))
         .spawn(move || decode_object(product, &path, &tx))?;
-    Ok(Decoder { product, rx, handle })
+    Ok(Decoder { rx, handle })
 }
 
 fn decode_object(product: Product, path: &Path, tx: &SyncSender<Result<Event>>) -> Result<DecodeStats> {

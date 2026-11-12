@@ -62,11 +62,11 @@ pub enum Error {
     #[error("malformed CSV row")]
     MalformedRow,
 
-    #[error("event ts {ts} is more than the reorder window behind {frontier}")]
-    OutOfOrder { ts: i64, frontier: i64 },
-
     #[error("{0}")]
     Manifest(String),
+
+    #[error("a day exceeds {0} events; raise MAX_EVENTS_PER_DAY or add an external sort")]
+    DayTooLarge(usize),
 
     #[error("verification failed: {0}")]
     Verify(String),
