@@ -1,36 +1,35 @@
-# J1 — data spine, first slice
+# J1 — data spine, one verified month
 
-**Date:** 2026-11-12. **Status:** one day verified end to end; the month is the
-next run, not a claim.
-**Scope:** `sync`, `build`, `verify`, `funding` — Binance Vision archives into
+**Date:** 2026-11-12. **Status:** pass on 2024-01, BTCUSDT UM.
+**Scope:** `sync`, `funding`, `build`, `verify` — Binance Vision archives into
 the coupled tape of `trad/docs/data-contract.md`.
 
 ## What was run
 
 ```sh
-download-ticks sync   --symbol BTCUSDT --from-date 2024-01-15 --to-date 2024-01-15 --root data
+download-ticks sync    --symbol BTCUSDT --from-date 2024-01-01 --to-date 2024-01-31 --root data
 download-ticks funding --symbol BTCUSDT --root data --from-date 2024-01-01 --to-date 2024-02-01
-download-ticks build   --symbol BTCUSDT --from-date 2024-01-15 --to-date 2024-01-15 --root data
+download-ticks build   --symbol BTCUSDT --from-date 2024-01-01 --to-date 2024-01-31 --root data
 download-ticks verify  --root data --deep
 ```
 
-## Result — 2024-01-15, BTCUSDT UM
+## Result — 2024-01, BTCUSDT UM
 
 | object | rows | bytes |
 | --- | ---: | ---: |
-| klines 1m | 1,440 | 62,120 |
-| aggTrades | 1,036,190 | 13,510,974 |
-| bookTicker | 19,881,490 | 188,017,444 |
-| bookDepth | 2,880 (288 snapshots × 10 bands) | 477,151 |
-| funding (REST, in range) | 3 | 2,084 |
-| **tape** | **20,922,003 events** | **301.3 MiB zstd** |
+| bookTicker | 725,011,366 | 6.28 GiB |
+| aggTrades | 40,294,620 | 0.49 GiB |
+| bookDepth | 89,190 (8,919 snapshots × 10 bands) | 0.01 GiB |
+| klines 1m | 44,640 | 0.00 GiB |
+| funding (REST) | 93 | 2 KiB |
+| **tape** | **765,439,909 events** | **10.4 GiB zstd** |
 
-`dataset_id: sha256:297934394e9b86a61c49fe5181fcfb740c43cb8d40216cae8e579da8cc7917c2`
+`dataset_id: sha256:91db8fb0ce99f279bb49b1a064f13fd49828c8b0e11b2f69cd225d86c64311d0`
 
 ```text
-ok   dataset_id: sha256:297934394e9b86a61c49fe5181fcfb740c43cb8d40216cae8e579da8cc7917c2 (manifest says sha256:297934394e9b86a61c49fe5181fcfb740c43cb8d40216cae8e579da8cc7917c2)
-ok   objects/checksums: 5 objects
-ok   tape/structure: 1 day files, 20922003 events
+ok   dataset_id: sha256:91db8fb0ce99f279bb49b1a064f13fd49828c8b0e11b2f69cd225d86c64311d0 (manifest says sha256:91db8fb0ce99f279bb49b1a064f13fd49828c8b0e11b2f69cd225d86c64311d0)
+ok   objects/checksums: 125 objects
+ok   tape/structure: 31 day files, 765439909 events
 ok   tape/row-counts: match the manifest
 ok   raw/row-counts: decoded counts match
 ok   klines/grid: 0 gap run(s) listed, none filled
@@ -40,58 +39,51 @@ ok   funding/order: unique and ordered
 dataset verified.
 ```
 
-Timings on one core-worthy laptop: sync 6 min 01 s for 192.7 MiB; build 21–22 s
-for the day (decode, merge, zstd); `verify --deep` 37 s (re-decodes the raw).
+### Wall clock
 
-## Acceptance, one by one
+| step | time |
+| --- | ---: |
+| sync 124 objects, 6.8 GiB | 28 min 34 s |
+| build 31 days (decode, sort, zstd) | 15 min 49 s |
+| verify --deep (765M events + re-decode) | 34 min 04 s |
 
-| criterion (data-contract §9) | state |
+The sync ran at ~2–4 MiB/s once two objects were in flight, far above the
+570 KiB/s a single stream sustained; the month was budgeted at 3 h 45 and took
+29 min. The full 2019–2026 backfill is ~560 GiB of `bookTicker`: feasible on
+this link in ~2 days, not in an afternoon.
+
+## Acceptance, one by one (data-contract §9)
+
+| criterion | state |
 | --- | --- |
-| one month of BTCUSDT UM verifies | **not yet** — one day does; the month is a 3.5 h download |
-| the same month re-runs idempotently (zero new rows, zero new bytes) | **pass** — second sync: `0 downloaded, 4 already present, 192.7 MiB in 1.2s`; rebuild yields the same `dataset_id` |
-| a deliberate checksum flip is caught | **pass** — one byte flipped in `bookDepth`: `Quarantined`, exit 1, `*.quarantine-c69b4ae2cb52e775` |
-| a deliberate gap is reported and not filled | **pass** — a root without `bookTicker` and with 40 minutes removed from `klines` yields 2 gaps; `verify` reports `1 gap run(s) listed, none filled` and `1 archive gap(s) confirmed absent` |
-| the manifest hash is stable across a rebuild | **pass** — identical `dataset_id` across rebuilds |
-| a `trad` loader can replay one day with no event after the decision time | **open** — the loader is J1's last item and lives in `trad` |
-
-## Cost of the month (measured, not guessed)
-
-The link sustains ~570 KiB/s to `data.binance.vision` (and to Cloudflare; no
-proxy in the path). Object sizes for 2024-01, BTCUSDT UM:
-
-| object | month size | at 570 KiB/s |
-| --- | ---: | ---: |
-| bookTicker | 6.95 GiB | ~3 h 30 |
-| aggTrades | 522 MiB | ~15 min |
-| klines 1m | 1.9 MiB | seconds |
-| bookDepth | 477 KiB/day (no monthly object) | ~15 MiB, seconds |
-
-So one month ≈ 7.5 GiB ≈ **3 h 45** of download, plus ~11 min of build and
-~20 min of `verify --deep`. The full 2019–2026 backfill of `bookTicker` is
-~560 GiB, i.e. weeks at this rate: it needs a faster link or a smaller product
-set before it is scheduled.
+| one month of BTCUSDT UM (klines + aggTrades + bookTicker + bookDepth) verifies | **pass** — above |
+| the same month re-runs idempotently (zero new rows, zero new bytes) | **pass** — second sync reports `0 downloaded`, a second build reproduces the same `dataset_id` |
+| a deliberate checksum flip is caught | **pass** — one byte flipped in `bookDepth`: quarantined, exit 1 |
+| a deliberate gap is reported and not filled | **pass** — a root without `bookTicker` and 40 minutes removed from `klines` gives 2 gaps, `verify` confirms both and fills neither |
+| the manifest hash is stable across a rebuild | **pass** — identical `dataset_id` |
+| a `trad` loader can replay one day with no event after the decision time | **pass** — `trad` `src/tape.rs`, run on 2024-01-15: 8,984,201 events up to noon, last `ts` = cutoff − 1 ms |
 
 ## A finding: the archive is not time-ordered
 
-The first three-day build failed on 2024-01-02 with a 23.6 h timestamp
-inversion. The cause is in the object, not the reader: `bookTicker` for that day
-interleaves two `update_id` streams (`3755…` and `3761…`), and the second one
-carries the last seconds of the day from line 361,605 onwards. Measured on the
-file: **180,805 adjacent inversions in 18,508,654 rows**, the worst 85,936,029 ms.
+The first three-day build failed on 2024-01-02 with a 23.6 h inversion. The
+cause is in the object, not the reader: that day's `bookTicker` interleaves two
+`update_id` streams (`3755…` and `3761…`), and the second carries the last
+seconds of the day from line 361,605 onwards. Measured on the file: **180,805
+adjacent inversions in 18,508,654 rows**, the worst 85,936,029 ms.
 
-A reorder window cannot absorb that, so a day is now decoded in parallel and
-sorted by `(ts, kind, id)` before it is written. The tape is what the contract
-says it is; the archive only supplied the rows. Consequence: a 20M-event day
-costs ~1.5 GiB of memory at build time, capped at 40M events.
-
-After the change, the three-day rehearsal (2024-01-01..03) builds in 64 s and
-verifies: 50,743,801 events, `dataset_id sha256:1104aaa4…`, no gaps.
+A reorder window cannot absorb that, so a day is decoded in parallel and sorted
+by `(ts, kind, id)` before it is written. The tape is what the contract says it
+is; the archive only supplied the rows. Cost: ~1.5 GiB of memory for a 20M-event
+day, capped at 40M with a loud error.
 
 ## Limits
 
-- One asset, one venue, three rehearsal days; the month was still downloading. ETH/BNB and the month are untouched.
-- `bookDepth` has no monthly object, so the sync is daily per product.
-- The `trad` replay loader does not exist yet; the tape is verified but nothing
-  in `trad` reads it.
-- Duplicate detection is `verify`'s monotone-id check, not a manifest count;
-  `totals.duplicates` stays 0 by construction.
+- One asset, one venue, one month. ETH/BNB, 2020–2025, and the other 11 months
+  of 2024 are untouched.
+- `verify` is single-threaded: 34 minutes for a month, so a year is ~7 hours.
+  Parallelising it is the obvious next optimisation and does not change what is
+  checked.
+- Duplicate detection is a per-day id scan; `totals.duplicates` is written as 0
+  and the check itself lives in `verify`.
+- Funding is fetched by REST and is the only live call; it is pinned in the
+  manifest by the file's SHA-256.
