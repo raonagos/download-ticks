@@ -62,6 +62,14 @@ agg_trade_id,price,quantity,first_trade_id,last_trade_id,transact_time,is_buyer_
 the expected fields are an update id, best bid price/size, best ask price/size,
 and transaction/event times. It is a **one-level** book, not a ladder.
 
+Verified header: `update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time`.
+
+**The daily file is not sorted by time.** 2024-01-02 interleaves two
+`update_id` streams: from line 361,605 the file carries the last seconds of the
+day (`event_time` 23:59:59.8xx) between rows stamped 00:07. Counted on that
+file: 180,805 adjacent inversions in 18,508,654 rows, worst 85,936,029 ms.
+Sort by `event_time` before building a tape; a reorder window is not enough.
+
 **bookDepth** (USD-M), verified on `BTCUSDT-bookDepth-2024-01-15.zip`:
 
 ```text
