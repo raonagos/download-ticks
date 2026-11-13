@@ -33,18 +33,27 @@ present and skips the OIDC exchange.
 ## Cut a release
 
 1. Bump `version` in `Cargo.toml`.
-2. Update the README or the changelog if the release needs it.
-3. Commit and merge the change to `master`.
-4. Create and push an annotated tag:
+2. Refresh `Cargo.lock` so its entry for the crate matches the new version,
+   then commit `Cargo.toml` and `Cargo.lock` together:
+
+   ```sh
+   cargo update -p download-ticks
+   ```
+
+   A stale lockfile makes the GitHub run dirty the tree and fail at
+   `cargo package`, so the workflow checks this before anything else.
+3. Update the README or the changelog if the release needs it.
+4. Commit and merge the change to `master`.
+5. Create and push an annotated tag:
 
    ```sh
    git tag -a v1.8.0 -m "download-ticks 1.8.0"
    git push origin v1.8.0
    ```
 
-5. Watch the `Publish` workflow. It checks that the tag matches `Cargo.toml`,
+6. Watch the `Publish` workflow. It checks that the tag matches `Cargo.toml`,
    runs formatting, clippy, tests, and packaging, then publishes to crates.io.
-6. Confirm the release on <https://crates.io/crates/download-ticks> and
+7. Confirm the release on <https://crates.io/crates/download-ticks> and
    <https://docs.rs/download-ticks>.
 
 Tags must have the form `v<major>.<minor>.<patch>`. A tag that does not match

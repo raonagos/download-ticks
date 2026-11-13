@@ -48,6 +48,15 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Check Cargo.lock is up to date
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! cargo update --workspace --locked; then
+            echo "::error::Cargo.lock is out of date. Run 'cargo update --workspace' and commit Cargo.lock."
+            exit 1
+          fi
+
       - name: Verify tag matches Cargo.toml
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
@@ -65,7 +74,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Run clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Run tests
         run: cargo test --release --locked
