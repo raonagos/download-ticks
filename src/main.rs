@@ -17,7 +17,10 @@ mod errors;
 mod funding;
 mod manifest;
 mod market;
+mod parallel;
 mod tape;
+#[cfg(test)]
+mod testing;
 mod utils;
 mod verify;
 
@@ -74,7 +77,8 @@ async fn sync_archive(command: &SyncCommand) -> Result<()> {
     let products = parse_products(&command.products)?;
     let archive = Archive::new(&command.root, &command.symbol, &command.interval, command.retries)?;
     let started = std::time::Instant::now();
-    let results = archive.sync(&products, range.from, range.to, usize::from(command.jobs)).await?;
+    let jobs = resolved_jobs(command.jobs, parallel::cores());
+    let results = archive.sync(&products, range.from, range.to, jobs).await?;
 
     let mut downloaded = 0usize;
     let mut skipped = 0usize;
@@ -106,14 +110,15 @@ async fn sync_archive(command: &SyncCommand) -> Result<()> {
     }
 
     println!(
-        "{} objects: {} downloaded, {} already present, {} missing, {} failed; {} in {}.",
+        "{} objects: {} downloaded, {} already present, {} missing, {} failed; {} in {} ({} in flight).",
         results.len(),
         downloaded,
         skipped,
         missing,
         failed,
         build::human_bytes(bytes),
-        format_elapsed(started.elapsed())
+        format_elapsed(started.elapsed()),
+        jobs
     );
 
     if failed > 0 {
@@ -129,17 +134,20 @@ fn build_dataset(command: &BuildCommand) -> Result<()> {
     let range = Range::parse(&command.from_date, &command.to_date)?;
     let products = parse_products(&command.products)?;
     let commit = tool_commit();
-    let report = build::build(&command.root, &command.symbol, &command.interval, range, &products, &commit)?;
+    let jobs = resolved_jobs(command.jobs, parallel::build_jobs());
+    let report = build::build(&command.root, &command.symbol, &command.interval, range, &products, &commit, jobs)?;
     let manifest = &report.manifest;
 
     println!(
         "
-{} days, {} events, tape {} in {}.",
+{} days, {} events, tape {} in {} ({} day(s) in flight).",
         report.days,
         separator(report.events, ",")?,
         build::human_bytes(report.tape_bytes),
-        format_elapsed(std::time::Duration::from_millis(report.elapsed_ms as u64))
+        format_elapsed(std::time::Duration::from_millis(report.elapsed_ms as u64)),
+        jobs
     );
+    println!("memory budget: {}", build::human_bytes(report.memory_budget));
     println!(
         "manifest: {} objects, {} rows, {} raw, {} gaps",
         manifest.totals.objects,
@@ -153,7 +161,8 @@ fn build_dataset(command: &BuildCommand) -> Result<()> {
 
 /// Runs the contract's verification and exits non-zero on a failure.
 fn verify_dataset(command: &VerifyCommand) -> Result<()> {
-    let report = verify::verify(&command.root, command.deep)?;
+    let jobs = resolved_jobs(command.jobs, parallel::cores());
+    let report = verify::verify(&command.root, command.deep, jobs)?;
     for (name, ok, detail) in &report.checks {
         println!("{} {name}: {detail}", if *ok { "ok  " } else { "FAIL" });
     }
@@ -195,6 +204,11 @@ fn tool_commit() -> String {
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         .filter(|commit| !commit.is_empty())
         .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// Resolves a `--jobs` flag: `0` asks for the automatic choice.
+fn resolved_jobs(requested: u16, automatic: usize) -> usize {
+    if requested == 0 { automatic } else { usize::from(requested) }
 }
 
 fn format_elapsed(duration: std::time::Duration) -> String {

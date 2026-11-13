@@ -87,3 +87,27 @@ day, capped at 40M with a loud error.
   and the check itself lives in `verify`.
 - Funding is fetched by REST and is the only live call; it is pinned in the
   manifest by the file's SHA-256.
+
+## Addendum — later the same day
+
+`sync`, `build` and `verify` now use the machine's cores; the README's
+throughput section has the flags and the bounds. Re-measured on the same
+2024-01 dataset, same machine:
+
+| run | this report | now |
+| --- | ---: | ---: |
+| `build`, 5 days | 2m 36s at 127% CPU | 1m 28s at 298% CPU |
+| `verify --deep`, 5 days | 3m 58s at 99% CPU | 1m 45s at 381% CPU |
+| `verify --deep`, 31 days | 34m 04s at 99% CPU | 6m 54s at 975% CPU |
+| `sync`, 124 objects already present | 55 s at 12% CPU | 6.5 s at 75% CPU |
+
+`dataset_id` is unchanged: the parallel build writes byte-identical tapes and
+assembles the manifest in day order. The "verify is single-threaded" limit
+above describes the binary this report measured, not the current one.
+
+A fresh download does not improve, and the numbers say why: one day of objects
+(304 MiB) took 8m 29s with two in flight and 9m 06s with twelve, both at
+~0.6 MiB/s, and a bare `curl` to `data.binance.vision` and to Cloudflare both
+measure ~0.6 MiB/s from this host. The link is the cap, so the 560 GiB
+backfill is ~10 days of contiguous transfer, not the ~2 days estimated above
+at 2–4 MiB/s. Fewer products, or a faster link, is the only lever there.

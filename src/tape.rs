@@ -111,27 +111,43 @@ pub fn build_day(root: &Path, symbol: &str, interval: &str, date: NaiveDate, pro
     Ok(stats)
 }
 
-/// Reads the funding series for the days in `[from, to]`.
-pub fn funding_for(path: &Path, from: i64, to: i64) -> Result<Vec<Event>> {
-    let text = std::fs::read_to_string(path)?;
-    let mut events = Vec::new();
-    for line in text.lines().skip(1) {
-        let mut fields = line.split(',');
-        let (Some(ts), Some(rate)) = (fields.next(), fields.next()) else {
-            continue;
-        };
-        let Ok(ts) = ts.trim().parse::<i64>() else { continue };
-        let Ok(rate) = rate.trim().parse::<f64>() else { continue };
-        if ts < from || ts >= to {
-            continue;
+/// The funding series, parsed once for a whole build.
+///
+/// A funding file is a few dozen lines, but a build visits a thousand days:
+/// reading the CSV per day would be a thousand file reads for the same rows.
+/// It is read once and each day takes its slice.
+#[derive(Debug, Default, Clone)]
+pub struct FundingSeries {
+    events: Vec<Event>,
+}
+
+impl FundingSeries {
+    /// Reads `ts_ms,rate` rows, sorted by stamp.
+    pub fn read(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)?;
+        let mut events = Vec::new();
+        for line in text.lines().skip(1) {
+            let mut fields = line.split(',');
+            let (Some(ts), Some(rate)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            let Ok(ts) = ts.trim().parse::<i64>() else { continue };
+            let Ok(rate) = rate.trim().parse::<f64>() else { continue };
+            events.push(Event {
+                ts,
+                kind: Kind::Funding,
+                id: ts as u64,
+                payload: Payload::Funding { rate, stamp: ts },
+            });
         }
-        events.push(Event {
-            ts,
-            kind: Kind::Funding,
-            id: ts as u64,
-            payload: Payload::Funding { rate, stamp: ts },
-        });
+        events.sort_by_key(|event| event.key());
+        Ok(Self { events })
     }
-    events.sort_by_key(|event| event.key());
-    Ok(events)
+
+    /// The stamps in `[from, to)`, in stamp order.
+    pub fn for_day(&self, from: i64, to: i64) -> Vec<Event> {
+        let start = self.events.partition_point(|event| event.ts < from);
+        let end = self.events.partition_point(|event| event.ts < to);
+        self.events[start..end].to_vec()
+    }
 }

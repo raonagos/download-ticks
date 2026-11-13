@@ -2,18 +2,27 @@
 //!
 //! A dataset either passes all of them or it is not a dataset. Every failure is
 //! printed and the command exits non-zero; nothing is repaired here.
+//!
+//! The expensive parts — hashing every object, scanning every day's tape,
+//! decoding every raw object again — are independent per item, so they run on
+//! several threads. The checks are still decided in a fixed order: the first
+//! failure reported is the first one in the manifest, or the first day of the
+//! range, not whichever finished first.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+use chrono::NaiveDate;
 use serde_json::Value;
 
 use crate::archive::{Product, Range, sha256_file};
 use crate::build::day_start_ms;
 use crate::decode::decode_with;
 use crate::errors::Result;
-use crate::manifest::{Manifest, kline_gaps};
+use crate::manifest::{Manifest, ObjectEntry, kline_gaps};
+use crate::parallel;
 use crate::tape::tape_path;
 
 /// The outcome of a verification run.
@@ -32,8 +41,24 @@ impl Verification {
     }
 }
 
-/// Verifies a dataset rooted at `root`.
-pub fn verify(root: &Path, deep: bool) -> Result<Verification> {
+/// One day's tape, scanned.
+struct DayTape {
+    counts: BTreeMap<String, u64>,
+    minutes: Vec<i64>,
+}
+
+/// What scanning a day produced: a tape, nothing, or a broken tape.
+///
+/// A corrupt tape is a failed check, not an aborted run: the remaining checks
+/// still run and the report says which day broke.
+enum TapeScan {
+    Missing,
+    Failed(String),
+    Scanned(DayTape),
+}
+
+/// Verifies a dataset rooted at `root`, with `jobs` workers.
+pub fn verify(root: &Path, deep: bool, jobs: usize) -> Result<Verification> {
     let mut report = Verification::default();
     let mut manifest = Manifest::read(&Manifest::path(root))?;
 
@@ -46,48 +71,42 @@ pub fn verify(root: &Path, deep: bool) -> Result<Verification> {
     );
 
     // 1. every object is present and matches its checksum.
-    let mut objects_ok = true;
-    let mut objects_detail = format!("{} objects", manifest.objects.len());
-    for object in &manifest.objects {
-        let path = root.join(&object.path);
-        if !path.exists() {
-            objects_ok = false;
-            objects_detail = format!("{} is missing", object.path);
-            break;
-        }
-        let actual = sha256_file(&path)?;
-        if actual != object.sha256 {
-            objects_ok = false;
-            objects_detail = format!("{} hashes to {actual}, manifest says {}", object.path, object.sha256);
-            break;
-        }
-    }
+    let objects = parallel::map(&manifest.objects, jobs, |_, object| hash_object(root, object), |_, _| {})?;
+    let objects_ok = objects.iter().all(Option::is_none);
+    let objects_detail = match objects.iter().flatten().next() {
+        Some(detail) => detail.clone(),
+        None => format!("{} objects", manifest.objects.len()),
+    };
     report.record("objects/checksums", objects_ok, objects_detail);
 
     // 2 and 8. Row counts: tape against the manifest, and (deep) raw against it.
     let range = Range::parse(&manifest.range.from, &manifest.range.to)?;
-    let mut tape_counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let days: Vec<NaiveDate> = range.iter().collect();
+    let scans = parallel::map(&days, jobs, |_, day| scan_day(root, &manifest.symbol, *day), |_, _| {})?;
+
+    let mut tape_counts: BTreeMap<String, u64> = BTreeMap::new();
+    let mut kline_minutes: BTreeMap<NaiveDate, Vec<i64>> = BTreeMap::new();
     let mut tape_objects = 0usize;
     let mut tape_ok = true;
     let mut tape_detail = String::new();
-    let mut kline_minutes: std::collections::BTreeMap<chrono::NaiveDate, Vec<i64>> = std::collections::BTreeMap::new();
-
-    for day in range.iter() {
-        let path = tape_path(root, &manifest.symbol, day);
-        if !path.exists() {
-            tape_ok = false;
-            tape_detail = format!("tape for {day} is missing");
-            break;
-        }
-        tape_objects += 1;
-        match scan_tape(&path, &mut tape_counts) {
-            Ok(minutes) => {
-                kline_minutes.insert(day, minutes);
-            }
-            Err(error) => {
+    for (day, scan) in days.iter().zip(&scans) {
+        match scan {
+            TapeScan::Missing => {
                 tape_ok = false;
-                tape_detail = format!("tape for {day}: {error}");
+                tape_detail = format!("tape for {day} is missing");
                 break;
+            }
+            TapeScan::Failed(detail) => {
+                tape_ok = false;
+                tape_detail = format!("tape for {day}: {detail}");
+                break;
+            }
+            TapeScan::Scanned(tape) => {
+                tape_objects += 1;
+                kline_minutes.insert(*day, tape.minutes.clone());
+                for (kind, count) in &tape.counts {
+                    *tape_counts.entry(kind.clone()).or_default() += count;
+                }
             }
         }
     }
@@ -119,31 +138,16 @@ pub fn verify(root: &Path, deep: bool) -> Result<Verification> {
 
     // 8 (deep). Decode the raw objects again and compare to the manifest.
     if deep {
-        let mut deep_ok = true;
-        let mut deep_detail = String::new();
-        for object in &manifest.objects {
-            if object.kind == "funding" {
-                // Funding is a REST series, not a ZIP: its rows are checked
-                // through the tape count and its bytes through the checksum.
-                continue;
-            }
-            let Some(product) = Product::parse(&object.kind) else {
-                deep_ok = false;
-                deep_detail = format!("unknown kind {}", object.kind);
-                break;
-            };
-            let stats = decode_with(product, &root.join(&object.path), |_| true)?;
-            if stats.rows != object.rows {
-                deep_ok = false;
-                deep_detail = format!("{}: decoded {} rows, manifest says {}", object.path, stats.rows, object.rows);
-                break;
-            }
-        }
-        report.record(
-            "raw/row-counts",
-            deep_ok,
-            if deep_ok { "decoded counts match".to_owned() } else { deep_detail },
-        );
+        // Funding is a REST series, not a ZIP: its rows are checked through the
+        // tape count and its bytes through the checksum.
+        let raw_objects: Vec<&ObjectEntry> = manifest.objects.iter().filter(|object| object.kind != "funding").collect();
+        let decoded = parallel::map(&raw_objects, jobs, |_, object| decode_object(root, object), |_, _| {})?;
+        let deep_ok = decoded.iter().all(Option::is_none);
+        let deep_detail = match decoded.iter().flatten().next() {
+            Some(detail) => detail.clone(),
+            None => "decoded counts match".to_owned(),
+        };
+        report.record("raw/row-counts", deep_ok, deep_detail);
     }
 
     // 4. klines sit on the 1m grid and every hole is listed, nothing is filled.
@@ -228,12 +232,52 @@ pub fn verify(root: &Path, deep: bool) -> Result<Verification> {
     Ok(report)
 }
 
+/// Hashes one object and compares it to the manifest. `Some` is the failure.
+fn hash_object(root: &Path, object: &ObjectEntry) -> Result<Option<String>> {
+    let path = root.join(&object.path);
+    if !path.exists() {
+        return Ok(Some(format!("{} is missing", object.path)));
+    }
+    let actual = sha256_file(&path)?;
+    if actual != object.sha256 {
+        return Ok(Some(format!("{} hashes to {actual}, manifest says {}", object.path, object.sha256)));
+    }
+    Ok(None)
+}
+
+/// Decodes one raw object and compares its row count. `Some` is the failure.
+fn decode_object(root: &Path, object: &ObjectEntry) -> Result<Option<String>> {
+    let Some(product) = Product::parse(&object.kind) else {
+        return Ok(Some(format!("unknown kind {}", object.kind)));
+    };
+    let stats = decode_with(product, &root.join(&object.path), |_| true)?;
+    if stats.rows != object.rows {
+        return Ok(Some(format!(
+            "{}: decoded {} rows, manifest says {}",
+            object.path, stats.rows, object.rows
+        )));
+    }
+    Ok(None)
+}
+
+/// Scans one day's tape.
+fn scan_day(root: &Path, symbol: &str, day: NaiveDate) -> Result<TapeScan> {
+    let path = tape_path(root, symbol, day);
+    if !path.exists() {
+        return Ok(TapeScan::Missing);
+    }
+    match scan_tape(&path) {
+        Ok((counts, minutes)) => Ok(TapeScan::Scanned(DayTape { counts, minutes })),
+        Err(error) => Ok(TapeScan::Failed(error.to_string())),
+    }
+}
+
 fn parse_iso(value: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(value).ok().map(|moment| moment.timestamp_millis())
 }
 
-fn manifest_rows_by_kind(manifest: &Manifest) -> std::collections::BTreeMap<String, u64> {
-    let mut rows: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+fn manifest_rows_by_kind(manifest: &Manifest) -> BTreeMap<String, u64> {
+    let mut rows: BTreeMap<String, u64> = BTreeMap::new();
     for object in &manifest.objects {
         let kind = Product::parse(&object.kind).map(Product::event_kind).unwrap_or(object.kind.as_str());
         *rows.entry(kind.to_owned()).or_default() += object.rows;
@@ -242,7 +286,8 @@ fn manifest_rows_by_kind(manifest: &Manifest) -> std::collections::BTreeMap<Stri
 }
 
 /// Streams one day's tape and checks the per-event invariants.
-fn scan_tape(path: &Path, counts: &mut std::collections::BTreeMap<String, u64>) -> Result<Vec<i64>> {
+fn scan_tape(path: &Path) -> Result<(BTreeMap<String, u64>, Vec<i64>)> {
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
     let file = File::open(path)?;
     let decoder = zstd::Decoder::new(BufReader::with_capacity(1 << 20, file))?;
     let decoder = BufReader::new(decoder);
@@ -250,7 +295,7 @@ fn scan_tape(path: &Path, counts: &mut std::collections::BTreeMap<String, u64>) 
     let mut last_kind = 0u8;
     // The tape is sorted by (ts, kind, id), not by id: ids are collected and
     // checked for uniqueness after the scan, never for monotonicity.
-    let mut ids: std::collections::BTreeMap<String, Vec<u64>> = std::collections::BTreeMap::new();
+    let mut ids: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     let mut kline_minutes: Vec<i64> = Vec::new();
 
     for line in decoder.lines() {
@@ -325,7 +370,7 @@ fn scan_tape(path: &Path, counts: &mut std::collections::BTreeMap<String, u64>) 
         }
     }
 
-    Ok(kline_minutes)
+    Ok((counts, kline_minutes))
 }
 
 fn positive(value: &Value, field: &str) -> bool {
@@ -340,5 +385,70 @@ fn kind_rank(kind: &str) -> u8 {
         "kline" => 3,
         "trade" => 4,
         _ => 5,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::build::build;
+    use crate::testing::{scratch, write_klines};
+    use std::fs;
+
+    /// Two days of klines, built and ready to verify.
+    fn dataset(name: &str) -> (std::path::PathBuf, Range) {
+        let root = scratch(name);
+        let range = Range::parse("2024-01-15", "2024-01-16").unwrap();
+        for date in range.iter() {
+            write_klines(&root, date, 4);
+        }
+        build(&root, "BTCUSDT", "1m", range, &[Product::Klines], "test", 2).unwrap();
+        (root, range)
+    }
+
+    #[test]
+    fn a_parallel_verification_reports_the_same_checks() {
+        let (root, _) = dataset("verify-parallel");
+
+        let one = verify(&root, true, 1).unwrap();
+        let many = verify(&root, true, 4).unwrap();
+
+        assert_eq!(one.checks, many.checks);
+        assert!(one.failures.is_empty(), "{:?}", one.failures);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_missing_tape_day_fails_the_structure_check() {
+        let (root, range) = dataset("verify-missing-tape");
+        fs::remove_file(tape_path(&root, "BTCUSDT", range.from)).unwrap();
+
+        let report = verify(&root, false, 4).unwrap();
+
+        let structure = report
+            .checks
+            .iter()
+            .find(|(name, _, _)| name == "tape/structure")
+            .expect("the structure check runs");
+        assert!(!structure.1);
+        assert!(structure.2.contains(&range.from.to_string()), "detail names the day: {}", structure.2);
+        assert!(report.failures.iter().any(|failure| failure.starts_with("tape/structure")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_corrupt_tape_is_a_failed_check_not_an_aborted_run() {
+        let (root, range) = dataset("verify-corrupt-tape");
+        let path = tape_path(&root, "BTCUSDT", range.to);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.truncate(bytes.len() / 2);
+        fs::write(&path, bytes).unwrap();
+
+        let report = verify(&root, false, 2).unwrap();
+
+        assert!(report.failures.iter().any(|failure| failure.starts_with("tape/structure")));
+        // The other checks still ran and were reported.
+        assert!(report.checks.iter().any(|(name, _, _)| name == "klines/grid"));
+        fs::remove_dir_all(root).unwrap();
     }
 }
