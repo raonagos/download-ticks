@@ -1,6 +1,6 @@
 [package]
 name = "download-ticks"
-version = "1.8.0"
+version = "1.8.1"
 edition = "2024"
 authors = ["tetuaoro <65575727+tetuaoro@users.noreply.github.com>"]
 description = "Fetch, verify, and normalise Binance klines, trades, book, and funding."
