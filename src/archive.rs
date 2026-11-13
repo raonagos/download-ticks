@@ -255,7 +255,7 @@ async fn fetch_object(
     let url = product.url_at(base, symbol, date, interval);
 
     if path.exists() {
-        let stored = sha256_file(&path)?;
+        let stored = hash_in_background(path.clone()).await?;
         match expected_checksum(client, &url, retries).await? {
             Some(expected) if expected == stored => {
                 let bytes = fs::metadata(&path)?.len();
@@ -314,8 +314,9 @@ async fn fetch_object(
         });
     };
 
-    let bytes = download_to_part(client, &url, &path, retries).await?;
-    let stored = sha256_file(&path)?;
+    // The digest is taken while the bytes are written, so a downloaded object
+    // is read once, not twice.
+    let (bytes, stored) = download_to_part(client, &url, &path, retries).await?;
     if stored != expected {
         let quarantined = quarantine(&path, &stored)?;
         return Ok(ObjectResult {
@@ -398,7 +399,11 @@ async fn head_status(client: &Client, url: &str, retries: u32) -> Result<Option<
 }
 
 /// Streams one object to `<path>.part`, then renames it into place.
-async fn download_to_part(client: &Client, url: &str, path: &Path, retries: u32) -> Result<u64> {
+///
+/// Returns the size and the SHA-256 of the bytes as they were written: the
+/// hash the provider publishes is the hash of the object, and hashing on the
+/// way in costs one pass instead of two.
+async fn download_to_part(client: &Client, url: &str, path: &Path, retries: u32) -> Result<(u64, String)> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -422,7 +427,7 @@ async fn download_to_part(client: &Client, url: &str, path: &Path, retries: u32)
     }
 }
 
-async fn attempt_download(client: &Client, url: &str, part: &Path) -> Result<u64> {
+async fn attempt_download(client: &Client, url: &str, part: &Path) -> Result<(u64, String)> {
     let mut response = client.get(url).send().await?;
     if !response.status().is_success() {
         return Err(Error::HttpStatus {
@@ -431,13 +436,15 @@ async fn attempt_download(client: &Client, url: &str, part: &Path) -> Result<u64
         });
     }
     let mut file = File::create(part)?;
+    let mut hasher = Sha256::new();
     let mut bytes = 0u64;
     while let Some(chunk) = response.chunk().await? {
         file.write_all(&chunk)?;
+        hasher.update(&chunk);
         bytes += chunk.len() as u64;
     }
     file.sync_all()?;
-    Ok(bytes)
+    Ok((bytes, format!("{:x}", hasher.finalize())))
 }
 
 /// Moves a corrupt object aside with both hashes in its name.
@@ -448,6 +455,9 @@ fn quarantine(path: &Path, actual: &str) -> Result<PathBuf> {
 }
 
 /// Hex SHA-256 of a file.
+///
+/// Hashing is CPU work: callers on the async runtime hand it to the blocking
+/// pool (`hash_in_background`) so a hash never stalls the download tasks.
 pub fn sha256_file(path: &Path) -> Result<String> {
     let mut reader = BufReader::with_capacity(1 << 20, File::open(path)?);
     let mut hasher = Sha256::new();
@@ -460,6 +470,11 @@ pub fn sha256_file(path: &Path) -> Result<String> {
         hasher.update(&buffer[..read]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Hashes a file on the blocking pool, keeping the runtime free.
+async fn hash_in_background(path: PathBuf) -> Result<String> {
+    tokio::task::spawn_blocking(move || sha256_file(&path)).await?
 }
 
 /// A calendar range, inclusive.

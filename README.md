@@ -15,6 +15,9 @@ output.
 
 - **Concurrent and bounded.** `--jobs` controls how many requests are in
   flight. Each request runs as a Tokio task on the multi-thread runtime.
+  The archive commands use the CPU as well: `sync` keeps several objects in
+  flight, and `build` and `verify` run their independent units — a day, an
+  object — on worker threads.
 - **Resilient.** Retries `408`, `429`, `5xx`, connection, and timeout failures
   with exponential backoff and jitter; honours `Retry-After`.
 - **Bounded memory.** Completed chunks are written in request order as soon as
@@ -101,7 +104,7 @@ research, and it is the input to `trad`.
 
 ```sh
 # 1. Raw objects: verified against the provider's CHECKSUM, atomic, idempotent.
-download-ticks sync --symbol BTCUSDT --from-date 2024-01-15 --to-date 2024-01-15 --root data
+download-ticks sync --symbol BTCUSDT --from-date 2024-01-15 --to-date 2024-01-15 --root data -j 8
 
 # 2. Funding stamps (REST, no archive): normalised to ts_ms,rate.
 download-ticks funding --symbol BTCUSDT --root data --from-date 2024-01-01 --to-date 2024-02-01
@@ -146,6 +149,43 @@ compressed. Kinds: `trade`, `book_ticker`, `book_depth`, `kline`, `funding`.
 The manifest records every object (path, SHA-256, rows, timestamp bounds), the
 gap list, and `dataset_id` — the SHA-256 of the manifest with `dataset_id` and
 `created_utc` blanked, so the identity survives a rebuild.
+
+### Throughput
+
+`sync` waits on the network; `build` and `verify` work on the CPU. All three
+are parallel, and `--jobs` (0, the default, means automatically) says how much.
+
+| command | unit | default |
+| --- | --- | --- |
+| `sync` | one archived object | one per core |
+| `build` | one day (decoded, sorted, written) | one per three cores, at most four, within the memory budget |
+| `verify` | one object or one tape day | one per core |
+
+Two things make the parallel build safe to trust:
+
+- **The output does not depend on the order days finish.** Days are independent
+  files and the manifest is assembled in day order, so a parallel rebuild
+  writes byte-identical tapes and the same `dataset_id` as a sequential one.
+- **Memory is bounded by a budget, not by hope.** A day is sorted in memory
+  before it is written, at roughly ten bytes of RAM per archived byte. The
+  workers share three fifths of the available RAM and admit a day only when its
+  estimated footprint fits; a day bigger than the whole budget still runs, alone.
+
+Measured on this machine (12 cores, 15 GiB, NVMe), 2024-01 BTCUSDT UM:
+
+| run | before | after |
+| --- | --- | --- |
+| `build`, 5 days, 1.7 GiB of tape | 2m 36s, 127% CPU | 1m 28s, 298% CPU, 6.7 GiB peak |
+| `verify --deep`, 5 days | 3m 58s, 99% CPU | 1m 45s, 381% CPU |
+| `verify --deep`, 31 days, 765M events | 34m 04s, 99% CPU | 6m 54s, 975% CPU, 2.0 GiB peak |
+| `sync`, idempotent over 124 objects | 55 s, 12% CPU | 6.5 s, 75% CPU |
+
+An idempotent `sync` is dominated by the per-object `CHECKSUM` round trip, not
+by hashing: with two objects in flight the run spends its time on network
+latency with the cores idle. A fresh download is bandwidth-bound instead, and
+here the link is the cap: the same 304 MiB of objects took 8m 29s with two in
+flight and 9m 06s with twelve, both at ~0.6 MiB/s, while a bare `curl` to the
+same host measures the same. More streams only help when the link has room.
 
 `verify` checks the checksums, the manifest row counts, the tape structure and
 per-kind invariants (non-crossed book, ten depth bands, positive trade sizes,

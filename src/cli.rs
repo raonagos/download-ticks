@@ -144,7 +144,7 @@ are reported, never filled.
     $ download-ticks info -f output.json
 
 ## Examples — archive dataset
-  $ download-ticks sync  --symbol BTCUSDT --from-date 2024-01-15 --to-date 2024-01-15 --root data
+  $ download-ticks sync  --symbol BTCUSDT --from-date 2024-01-15 --to-date 2024-01-15 --root data -j 8
   $ download-ticks funding --symbol BTCUSDT --from-date 2024-01-01 --to-date 2024-02-01 --root data
   $ download-ticks build --symbol BTCUSDT --from-date 2024-01-15 --to-date 2024-01-15 --root data
   $ download-ticks verify --root data --deep
@@ -215,8 +215,8 @@ pub struct SyncCommand {
     #[arg(long, default_value = "klines,aggTrades,bookTicker,bookDepth")]
     pub products: String,
 
-    /// Objects in flight.
-    #[arg(short = 'j', long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(1..=16))]
+    /// Objects in flight; 0 means one per core.
+    #[arg(short = 'j', long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=64))]
     pub jobs: u16,
 
     /// Retries per object after the first attempt.
@@ -254,6 +254,12 @@ pub struct BuildCommand {
     /// Comma-separated products: klines,aggTrades,bookTicker,bookDepth.
     #[arg(long, default_value = "klines,aggTrades,bookTicker,bookDepth")]
     pub products: String,
+
+    /// Days built at once; 0 means one per three cores, at most four. A day is
+    /// sorted in memory before it is written (about 3 GiB for 35M events), so
+    /// the workers share a budget of three fifths of the free RAM.
+    #[arg(short = 'j', long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=16))]
+    pub jobs: u16,
 }
 
 /// Command-line arguments for verification.
@@ -266,6 +272,10 @@ pub struct VerifyCommand {
     /// Also decode every raw object again and compare its row count.
     #[arg(long)]
     pub deep: bool,
+
+    /// Objects and days checked at once; 0 means one per core.
+    #[arg(short = 'j', long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=64))]
+    pub jobs: u16,
 }
 
 /// Command-line arguments for the funding series.
