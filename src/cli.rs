@@ -113,19 +113,24 @@ impl fmt::Display for Interval {
     version,
     about,
     long_about = "
-This tool fetches historical candlestick (kline) data from exchanges like Binance.
-You can specify a trading pair (e.g., BTCUSDT), time interval (e.g., 1m, 1h, 1d),
-and optional start/end dates. The data is saved to a JSON file if --output-file is provided.
+`download-ticks` has two modes.
 
-Requests run concurrently on the Tokio runtime, bounded by --jobs. Transient
-failures (429, 408, 5xx, timeouts) are retried with exponential backoff.
-Binance defaults to USD-M perpetual futures; pass --venue spot for spot klines.
+Fetch: pull klines over a REST range into one JSON array, concurrently, with
+retries and ordered streaming writes. Binance defaults to USD-M perpetual
+futures; pass --venue spot for spot klines.
+
+Archive: build a verified research dataset from Binance Vision bulk archives.
+`sync` downloads the daily ZIPs and checks them against the provider CHECKSUM,
+`build` decodes them into one canonical event tape and writes the manifest that
+identifies the dataset, `verify` runs the data contract's checks, and `funding`
+fetches the funding series from REST. Objects are idempotent and atomic; gaps
+are reported, never filled.
 
 ## Supported Exchanges
 - Binance
-- Gate.io
+- Gate.io (fetch only)
 
-Examples:
+## Examples — fetch
   Fetch 1-hour BTCUSDT klines for the latest 1000 hours:
     $ download-ticks fetch -s BTCUSDT -i 1h
 
@@ -137,6 +142,12 @@ Examples:
 
   Show information of output.json file:
     $ download-ticks info -f output.json
+
+## Examples — archive dataset
+  $ download-ticks sync  --symbol BTCUSDT --from-date 2024-01-15 --to-date 2024-01-15 --root data
+  $ download-ticks funding --symbol BTCUSDT --from-date 2024-01-01 --to-date 2024-02-01 --root data
+  $ download-ticks build --symbol BTCUSDT --from-date 2024-01-15 --to-date 2024-01-15 --root data
+  $ download-ticks verify --root data --deep
 "
 )]
 pub struct Cli {
