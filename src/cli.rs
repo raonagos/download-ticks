@@ -113,19 +113,24 @@ impl fmt::Display for Interval {
     version,
     about,
     long_about = "
-This tool fetches historical candlestick (kline) data from exchanges like Binance.
-You can specify a trading pair (e.g., BTCUSDT), time interval (e.g., 1m, 1h, 1d),
-and optional start/end dates. The data is saved to a JSON file if --output-file is provided.
+`download-ticks` has two modes.
 
-Requests run concurrently on the Tokio runtime, bounded by --jobs. Transient
-failures (429, 408, 5xx, timeouts) are retried with exponential backoff.
-Binance defaults to USD-M perpetual futures; pass --venue spot for spot klines.
+Fetch: pull klines over a REST range into one JSON array, concurrently, with
+retries and ordered streaming writes. Binance defaults to USD-M perpetual
+futures; pass --venue spot for spot klines.
+
+Archive: build a verified research dataset from Binance Vision bulk archives.
+`sync` downloads the daily ZIPs and checks them against the provider CHECKSUM,
+`build` decodes them into one canonical event tape and writes the manifest that
+identifies the dataset, `verify` runs the data contract's checks, and `funding`
+fetches the funding series from REST. Objects are idempotent and atomic; gaps
+are reported, never filled.
 
 ## Supported Exchanges
 - Binance
-- Gate.io
+- Gate.io (fetch only)
 
-Examples:
+## Examples — fetch
   Fetch 1-hour BTCUSDT klines for the latest 1000 hours:
     $ download-ticks fetch -s BTCUSDT -i 1h
 
@@ -137,6 +142,12 @@ Examples:
 
   Show information of output.json file:
     $ download-ticks info -f output.json
+
+## Examples — archive dataset
+  $ download-ticks sync  --symbol BTCUSDT --from-date 2024-01-15 --to-date 2024-01-15 --root data
+  $ download-ticks funding --symbol BTCUSDT --from-date 2024-01-01 --to-date 2024-02-01 --root data
+  $ download-ticks build --symbol BTCUSDT --from-date 2024-01-15 --to-date 2024-01-15 --root data
+  $ download-ticks verify --root data --deep
 "
 )]
 pub struct Cli {
@@ -167,6 +178,114 @@ pub enum Commands {
     Fetch(Command),
     /// Display information about a JSON file containing klines.
     Info(InfoCommand),
+    /// Download raw archive objects from Binance Vision, verified by checksum.
+    Sync(SyncCommand),
+    /// Decode the raw objects into the canonical tape and write the manifest.
+    Build(BuildCommand),
+    /// Check a dataset against data-contract section 7.
+    Verify(VerifyCommand),
+    /// Fetch the funding series from the REST endpoint.
+    Funding(FundingCommand),
+}
+
+/// Command-line arguments for the archive sync.
+#[derive(Debug, Clone, Parser)]
+pub struct SyncCommand {
+    /// The trading pair symbol (e.g., BTCUSDT).
+    #[arg(short, long)]
+    pub symbol: String,
+
+    /// Kline interval of the archived objects.
+    #[arg(long, default_value = "1m")]
+    pub interval: String,
+
+    /// First day, inclusive (YYYY-MM-DD, UTC).
+    #[arg(long)]
+    pub from_date: String,
+
+    /// Last day, inclusive (YYYY-MM-DD, UTC).
+    #[arg(long)]
+    pub to_date: String,
+
+    /// Dataset root.
+    #[arg(long, default_value = "data")]
+    pub root: PathBuf,
+
+    /// Comma-separated products: klines,aggTrades,bookTicker,bookDepth.
+    #[arg(long, default_value = "klines,aggTrades,bookTicker,bookDepth")]
+    pub products: String,
+
+    /// Objects in flight.
+    #[arg(short = 'j', long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(1..=16))]
+    pub jobs: u16,
+
+    /// Retries per object after the first attempt.
+    #[arg(short = 'r', long, default_value_t = 3, value_parser = clap::value_parser!(u16).range(0..=10))]
+    pub retries: u16,
+
+    /// Print every object.
+    #[arg(short, long)]
+    pub verbose: bool,
+}
+
+/// Command-line arguments for the tape build.
+#[derive(Debug, Clone, Parser)]
+pub struct BuildCommand {
+    /// The trading pair symbol (e.g., BTCUSDT).
+    #[arg(short, long)]
+    pub symbol: String,
+
+    /// Kline interval of the archived objects.
+    #[arg(long, default_value = "1m")]
+    pub interval: String,
+
+    /// First day, inclusive (YYYY-MM-DD, UTC).
+    #[arg(long)]
+    pub from_date: String,
+
+    /// Last day, inclusive (YYYY-MM-DD, UTC).
+    #[arg(long)]
+    pub to_date: String,
+
+    /// Dataset root.
+    #[arg(long, default_value = "data")]
+    pub root: PathBuf,
+
+    /// Comma-separated products: klines,aggTrades,bookTicker,bookDepth.
+    #[arg(long, default_value = "klines,aggTrades,bookTicker,bookDepth")]
+    pub products: String,
+}
+
+/// Command-line arguments for verification.
+#[derive(Debug, Clone, Parser)]
+pub struct VerifyCommand {
+    /// Dataset root.
+    #[arg(long, default_value = "data")]
+    pub root: PathBuf,
+
+    /// Also decode every raw object again and compare its row count.
+    #[arg(long)]
+    pub deep: bool,
+}
+
+/// Command-line arguments for the funding series.
+#[derive(Debug, Clone, Parser)]
+pub struct FundingCommand {
+    /// The trading pair symbol (e.g., BTCUSDT).
+    #[arg(short, long)]
+    pub symbol: String,
+
+    /// First day, inclusive (YYYY-MM-DD, UTC). Defaults to the symbol listing.
+    #[arg(long)]
+    pub from_date: Option<String>,
+
+    /// Last day, inclusive (YYYY-MM-DD, UTC). Defaults to today.
+    #[arg(long)]
+    pub to_date: Option<String>,
+
+    /// Dataset root.
+    #[arg(long, default_value = "data")]
+    pub root: PathBuf,
 }
 
 /// Command-line arguments for fetching klines.

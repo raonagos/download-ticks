@@ -3,9 +3,11 @@
 A command-line tool for downloading historical trading data from public
 exchange APIs.
 
-`download-ticks` fetches klines (candlesticks) over a date range, splits the
-range into API-sized chunks, downloads the chunks concurrently, and stores the
-exchange's raw JSON rows in one array. It is built for reliable bulk downloads:
+`download-ticks` has two modes. `fetch` pulls klines over a REST range and
+stores the exchange's raw JSON rows in one array. `sync`/`build` pull the
+public bulk archives (klines, aggTrades, bookTicker, bookDepth) plus the funding
+series, verify them by checksum, and decode them into one canonical event tape
+with a manifest that identifies the dataset. It is built for reliable bulk downloads:
 bounded concurrency, retries with backoff, ordered streaming writes, and atomic
 output.
 
@@ -91,6 +93,66 @@ Without a date range the exchange's default page (up to 1,000 candles) is
 fetched. Without `--output-file` the data is downloaded and counted but not
 stored.
 
+## Archive datasets
+
+Binance publishes daily ZIPs for USD-M futures with a `.CHECKSUM` sibling. The
+archive path is the only supported way to build a dataset large enough for
+research, and it is the input to `trad`.
+
+```sh
+# 1. Raw objects: verified against the provider's CHECKSUM, atomic, idempotent.
+download-ticks sync --symbol BTCUSDT --from-date 2024-01-15 --to-date 2024-01-15 --root data
+
+# 2. Funding stamps (REST, no archive): normalised to ts_ms,rate.
+download-ticks funding --symbol BTCUSDT --root data --from-date 2024-01-01 --to-date 2024-02-01
+
+# 3. Decode raw into the tape and write data/manifest.json.
+download-ticks build --symbol BTCUSDT --from-date 2024-01-15 --to-date 2024-01-15 --root data
+
+# 4. The nine checks of the data contract.
+download-ticks verify --root data --deep
+```
+
+Layout under `--root`:
+
+```text
+data/
+  manifest.json
+  raw/binance/um/BTCUSDT/{klines/1m,aggTrades,bookTicker,bookDepth}/*.zip
+  tape/binance/um/BTCUSDT/YYYY-MM-DD.jsonl.zst
+  funding/binance/um/BTCUSDT.csv
+```
+
+Guarantees:
+
+- **Verified before decode.** A downloaded object is checked against the
+  provider's SHA-256 before it is renamed into place. A mismatch is quarantined
+  (`*.zip.quarantine-<hash16>`) and the run exits non-zero.
+- **Idempotent.** An object already present with a matching hash is not
+  downloaded again; re-running `build` reproduces the same `dataset_id`.
+- **Atomic.** Every file is written to `.part` and renamed, so a crash never
+  leaves a half object or a half manifest.
+- **No filled gaps.** A missing day, or a missing minute, is listed in the
+  manifest and stays missing in the tape.
+- **A day is sorted, not assumed sorted.** The archive is not time-ordered: a
+  2024-01-02 `bookTicker` file interleaves two `update_id` streams and shows
+  180,805 adjacent timestamp inversions in 18.5M rows. A day is therefore
+  decoded in parallel, sorted by `(ts, kind, id)`, and only then written.
+  That costs ~1.5 GiB for a 20M-event day, with a 40M-event cap that fails
+  loudly instead of swapping.
+
+The tape is one JSON object per line, sorted by `(ts, kind, id)`, zstd
+compressed. Kinds: `trade`, `book_ticker`, `book_depth`, `kline`, `funding`.
+The manifest records every object (path, SHA-256, rows, timestamp bounds), the
+gap list, and `dataset_id` — the SHA-256 of the manifest with `dataset_id` and
+`created_utc` blanked, so the identity survives a rebuild.
+
+`verify` checks the checksums, the manifest row counts, the tape structure and
+per-kind invariants (non-crossed book, ten depth bands, positive trade sizes,
+monotone ids, 1m kline grid, ordered funding), that every kline hole is listed
+and none is filled, and that `dataset_id` recomputes. `--deep` also decodes
+every raw object again and compares its row count.
+
 ## Output format
 
 Each output file is one JSON array. Every element is the exchange's raw kline
@@ -130,14 +192,11 @@ never filled or interpolated.
 
 ## Roadmap
 
-1. **Bulk archives.** Download Binance Vision daily/monthly ZIPs with their
-   `CHECKSUM` files for large backfills instead of paginating REST.
-2. **More products.** Aggregated trades, book ticker, aggregate book depth, and
-   funding rates.
-3. **Dataset manifest and verification.** Record source, range, checksums, row
-   counts, and gaps; add a `verify` command.
-4. **Resume and idempotency.** Skip objects already present and verified.
-5. **More exchanges and venues.**
+- ~~Bulk archives, more products, dataset manifest with verification,
+  resume/idempotency~~ — delivered by `sync`, `build`, and `verify`.
+- Monthly archive objects (daily is used today: one request per day and
+  product).
+- More exchanges and venues.
 
 Reference notes for archive layouts and schemas are in
 [`docs/data-sources.md`](docs/data-sources.md).
