@@ -189,7 +189,7 @@ async fn fetch_funding(command: &FundingCommand) -> Result<()> {
     };
     let from_ms = build::day_start_ms(from);
     let to_ms = build::day_start_ms(to) + 86_400_000;
-    let stamps = funding::fetch(&command.root, &command.symbol, from_ms, to_ms).await?;
+    let stamps = funding::fetch(&command.root, &command.symbol, from_ms, to_ms, command.source).await?;
     println!("{stamps} funding stamps, {} .. {}.", from, to);
     Ok(())
 }

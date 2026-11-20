@@ -103,14 +103,27 @@ must detect the unit.
 
 ## 4. Funding
 
-Funding is REST, not an archive:
+Funding is archived monthly, with a `.CHECKSUM` sibling:
+
+```text
+data/futures/um/monthly/fundingRate/BTCUSDT/BTCUSDT-fundingRate-2024-01.zip
+```
+
+The ZIP holds one CSV, `calc_time,funding_interval_hours,last_funding_rate`,
+three stamps a day at the 8-hour settlement times. Rates are fractions, not
+percent. This is the default source: checksummed, reproducible, and reachable
+from networks that block the API.
+
+The REST endpoint remains available as `--source rest`:
 
 ```text
 GET https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&startTime=<ms>&limit=1000
 ```
 
-Paginate by `fundingTime + 1`, cap at the API limit, deduplicate by stamp. Rates
-are fractions, not percent.
+Paginate by `fundingTime + 1`, cap at the API limit, deduplicate by stamp. Some
+networks answer `fapi.binance.com` with `451 Unavailable For Legal Reasons`; the
+client then tries `www.binance.com` on the same path, and fails loudly if both
+refuse.
 
 ## 5. Coverage
 

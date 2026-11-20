@@ -296,6 +296,11 @@ pub struct FundingCommand {
     /// Dataset root.
     #[arg(long, default_value = "data")]
     pub root: PathBuf,
+
+    /// Where the stamps come from: the Vision archive (checksummed,
+    /// reproducible) or the live REST endpoint (may be geo-blocked).
+    #[arg(long, value_enum, default_value = "archive")]
+    pub source: crate::funding::Source,
 }
 
 /// Command-line arguments for fetching klines.
