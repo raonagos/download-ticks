@@ -106,7 +106,8 @@ research, and it is the input to `trad`.
 # 1. Raw objects: verified against the provider's CHECKSUM, atomic, idempotent.
 download-ticks sync --symbol BTCUSDT --from-date 2024-01-15 --to-date 2024-01-15 --root data -j 8
 
-# 2. Funding stamps (REST, no archive): normalised to ts_ms,rate.
+# 2. Funding stamps: monthly archive, checksummed, normalised to ts_ms,rate.
+#    `--source rest` falls back to the live endpoint (may be geo-blocked).
 download-ticks funding --symbol BTCUSDT --root data --from-date 2024-01-01 --to-date 2024-02-01
 
 # 3. Decode raw into the tape and write data/manifest.json.
